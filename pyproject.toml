@@ -1,0 +1,71 @@
+[project]
+name = "aihoo-agent"
+version = "0.1.0"
+description = "AI 中医助手 Agent - 基于 qwen3.8-max + LangGraph 的智能中医问诊服务"
+readme = "README.md"
+requires-python = ">=3.13"
+license = {text = "MIT"}
+
+dependencies = [
+    # FastAPI Web 框架
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+
+    # Pydantic
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.7.0",
+
+    # LangGraph（问诊状态机编排；传递依赖 langchain-core）
+    "langgraph>=1.2.11",
+
+    # OpenAI 兼容客户端（统一文本/图片/结构化输出，走百炼 compatible-mode 网关）
+    "openai>=1.60.0",
+
+    # Redis
+    "redis>=5.2.0",
+
+    # MySQL (异步)
+    "sqlalchemy[asyncio]>=2.0.36",
+    "aiomysql>=0.2.0",
+
+    # HTTP 客户端（知识库检索）
+    "httpx>=0.28.1",
+
+    # 重试工具
+    "tenacity>=9.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/aihoo-agent"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.setuptools.packages.find]
+include = ["app", "app.*"]
+exclude = ["logs", "logs.*", "tests", "tests.*"]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]

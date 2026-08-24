@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker
+docker-data/
+
+# Caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# base line 仓库不提交的目录/文件（源码与初始化数据之外）
+docs/
+tests/
+CLAUDE.md
+format.json
