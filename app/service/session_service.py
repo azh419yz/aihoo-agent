@@ -51,6 +51,7 @@ SESSION_FIELD_NAMES: list[str] = [
     "hos_sick_info",
     "preliminary_diagnosis",
     "patient_select_pending",
+    "inquiry_progress",
 ]
 
 
@@ -109,6 +110,7 @@ class SessionService:
             "image_urls": [],
             "patient_mismatch": False,
             "mismatch_reason": "",
+            "inquiry_progress": {},
         }
 
     async def _restore_from_mysql(

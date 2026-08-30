@@ -565,6 +565,40 @@ class TcmMatcher:
 
         return "\n".join(parts)
 
+    def format_full_taxonomy(self) -> str:
+        """输出全部标准病名/证型及症状描述（供 LLM 全列表选择）
+
+        诊断不再用关键词候选做硬约束，而是把完整词汇表给 LLM，
+        LLM 必须从列表内选病名/证型。
+        """
+        parts = []
+        if self._diseases:
+            parts.append("## 标准病名列表")
+            for d in self._diseases:
+                name = d.get("disease_name", "")
+                if not name:
+                    continue
+                sym = d.get("common_symptoms") or ""
+                line = f"- {name}"
+                if sym:
+                    line += f"：常见症状 {sym}"
+                parts.append(line)
+        if self._syndromes:
+            parts.append("## 标准证型列表")
+            for s in self._syndromes:
+                name = s.get("syndrome_name", "")
+                if not name:
+                    continue
+                ms = s.get("main_symptoms") or ""
+                tp = s.get("tongue_pulse") or ""
+                line = f"- {name}"
+                if ms:
+                    line += f"：主要症状 {ms}"
+                if tp:
+                    line += f"；舌脉 {tp}"
+                parts.append(line)
+        return "\n".join(parts)
+
     # ----------------------------------------------------------------
     # 内部方法
     # ----------------------------------------------------------------

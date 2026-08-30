@@ -37,10 +37,10 @@ from app.agent.structured_output import (
     SymptomExtraction,
 )
 from app.agent.tools import generate_prescription, retrieve_knowledge
-from app.knowledge.prescription_index import prescription_index
+from app.knowledge.qianfan import format_retrieval_context, retrieve_with_filter
 from app.knowledge.tcm_matcher import tcm_matcher
 from app.models.chat_schema import InquiryJson, ResponseData
-from app.multimodal.medical_record import analyze_medical_record
+from app.multimodal.medical_record import analyze_medical_record, format_medical_record_basic_info
 from app.multimodal.tongue_face import analyze_face_images, analyze_tongue_images
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,7 @@ class ConsultationState(TypedDict, total=False):
     hos_sick_info: dict
     preliminary_diagnosis: dict
     patient_select_pending: bool
+    inquiry_progress: dict  # 问诊维度进度（主诉 + 6 个系统维度 → bool）
     # 会话历史（只读，由 save_message 追加，不写回）
     messages: list
 
@@ -172,6 +173,143 @@ def has_enough_patient_info(patient_info: dict) -> bool:
     )
 
 
+# ============================================================
+# 病历 / 基础信息 处理助手
+# ============================================================
+
+_REUPLOAD_RECORD_KEYWORDS = ("重新上传", "重新传", "重传", "传错", "重新发", "换一个")
+
+
+def _is_reupload_record_intent(message: str) -> bool:
+    """检测用户是否表达重新上传病历的意图
+
+    需同时提到"病历/病例"，避免把"重新上传舌照/面照"误判为病历重传
+    （舌面照重传由 diagnosis/prescribing 节点内的已有逻辑处理）。
+    """
+    if not message:
+        return False
+    if "病历" not in message and "病例" not in message:
+        return False
+    return any(k in message for k in _REUPLOAD_RECORD_KEYWORDS)
+
+
+def _merge_record_basic_info(collected: dict, record_data: dict) -> bool:
+    """把病历提取的基础信息合并进 collected，返回是否有变更
+
+    病历只提供基础信息（姓名/性别/年龄/身高/职业/体重），不涉及医疗内容；
+    后续用户在对话中提出修改时以用户修改为准（见 _apply_extracted_basic_fields）。
+    """
+    changed = False
+    if record_data.get("patient_name"):
+        collected["name"] = record_data["patient_name"]
+        changed = True
+    if record_data.get("patient_gender"):
+        collected["gender"] = record_data["patient_gender"]
+        changed = True
+    if record_data.get("patient_age"):
+        age_raw = record_data["patient_age"]
+        try:
+            collected["age"] = int(age_raw)
+        except (ValueError, TypeError):
+            collected["age"] = age_raw
+        changed = True
+    if record_data.get("patient_height"):
+        collected["height"] = record_data["patient_height"]
+        changed = True
+    if record_data.get("patient_occupation"):
+        collected["occupation"] = record_data["patient_occupation"]
+        changed = True
+    if record_data.get("patient_weight"):
+        collected["weight"] = record_data["patient_weight"]
+        changed = True
+    return changed
+
+
+def _apply_extracted_basic_fields(collected: dict, result: Any, user_msg: str) -> bool:
+    """把对话中结构化提取的基础信息字段应用到 collected，返回是否有变更
+
+    过敏史/既往史仅在消息明确提到相关关键词时写入（防止从无关对话误提取）。
+    姓名/性别/年龄/身高/职业/体重等基础信息以用户最新说法为准（用户修改优先）。
+    """
+    changed = False
+    if result.name:
+        collected["name"] = result.name
+        changed = True
+    if result.gender:
+        collected["gender"] = result.gender
+        changed = True
+    if result.age:
+        collected["age"] = result.age
+        changed = True
+    if result.height:
+        collected["height"] = result.height
+        changed = True
+    if result.occupation:
+        collected["occupation"] = result.occupation
+        changed = True
+    if result.weight:
+        collected["weight"] = result.weight
+        changed = True
+    if result.allergy_history not in (None, "") and "过敏" in user_msg:
+        collected["allergy_history"] = result.allergy_history
+        changed = True
+    if result.past_medical_history not in (None, ""):
+        has_kw = any(
+            k in user_msg for k in ["既往", "病史", "疾病", "手术", "住院", "得过", "大病"]
+        )
+        if has_kw:
+            collected["past_medical_history"] = result.past_medical_history
+            changed = True
+    if result.chief_complaint:
+        collected["chief_complaint"] = result.chief_complaint
+        changed = True
+    return changed
+
+
+# 付费前主诉维度（主诉链路是否问清）
+CHIEF_COMPLAINT_DIMENSION = "chief_complaint"
+# 付费后系统问诊维度（固定顺序）
+SYSTEMIC_DIMENSIONS = ["sleep", "diet", "stool", "urine", "emotion", "thermo"]
+
+
+def _systemic_done(progress: dict) -> bool:
+    """付费后系统问诊是否全部维度已覆盖"""
+    return all(progress.get(d) for d in SYSTEMIC_DIMENSIONS)
+
+
+def _build_diagnosis_query(state: dict[str, Any], chief_complaint: str = "") -> str:
+    """构建辨证/检索用 query：主诉 + 系统问诊维度文本（追问内容）"""
+    query = chief_complaint or state.get("request_message", "")
+    inquiry_data = state.get("inquiry") or {}
+    dims = "，".join(
+        v for k, v in inquiry_data.items() if k in SYSTEMIC_DIMENSIONS and v
+    )
+    if dims:
+        query = f"{query}，{dims}".strip("，")
+    return query
+
+
+def _build_prescription_query(
+    state: dict[str, Any], diagnosis: dict, chief_complaint: str = ""
+) -> str:
+    """构建开方 RAG 检索 query：疾病/证型 + 主诉 + 追问内容"""
+    parts = []
+    if diagnosis.get("disease"):
+        parts.append(f"疾病：{diagnosis['disease']}")
+    if diagnosis.get("syndrome"):
+        parts.append(f"证型：{diagnosis['syndrome']}")
+    q = chief_complaint or state.get("request_message", "")
+    if q:
+        parts.append(f"主诉：{q}")
+    inquiry_data = state.get("inquiry") or {}
+    dims = "，".join(
+        v for k, v in inquiry_data.items() if k in SYSTEMIC_DIMENSIONS and v
+    )
+    if dims:
+        parts.append(f"追问：{dims}")
+    return "，".join(parts)
+
+
 async def perform_diagnosis(
         state: dict[str, Any],
         orchestrator: LLMOrchestrator,
@@ -187,12 +325,9 @@ async def perform_diagnosis(
     patient_gender = patient_info.get("gender") if patient_info else None
     patient_age = patient_info.get("age") if patient_info else None
 
-    query = chief_complaint or request_message
+    query = _build_diagnosis_query(state, chief_complaint)
 
-    # 匹配候选证型（tcm_matcher 表内硬约束，防止 LLM 编造表外证型）
-    candidate_syndromes = [s["name"] for s in tcm_matcher.match_syndromes(query, top_k=5)]
-
-    # 检索知识库（带上性别年龄提高命中率）
+    # 检索知识库（带性别年龄提高命中率）
     knowledge_context = await retrieve_knowledge(
         query=query,
         knowledge_base="both",
@@ -201,7 +336,10 @@ async def perform_diagnosis(
         age=patient_age,
     )
 
-    # 构建辨证提示词（含候选证型约束）
+    # 全列表词汇表（LLM 必须从中选病名/证型，不再用关键词候选做硬约束）
+    taxonomy_text = tcm_matcher.format_full_taxonomy()
+
+    # 构建辨证提示词（含全列表选择约束）
     diagnosis_prompt = build_diagnosis_prompt(
         patient_info=patient_info,
         chief_complaint=chief_complaint or request_message,
@@ -209,10 +347,10 @@ async def perform_diagnosis(
         tongue_analysis=state.get("tongue_analysis") or [],
         face_analysis=state.get("face_analysis") or [],
         knowledge_context=knowledge_context,
-        candidate_syndromes=candidate_syndromes,
+        taxonomy_text=taxonomy_text,
     )
 
-    # 追加详细辨病辨证参考（疾病 + 证型明细）
+    # 追加详细辨病辨证参考（关键词匹配出的最相关疾病/证型明细，辅助 LLM 决策）
     tcm_ctx = tcm_matcher.format_context(query, top_k=5)
     if tcm_ctx:
         diagnosis_prompt = f"{diagnosis_prompt}\n\n{tcm_ctx}"
@@ -270,12 +408,29 @@ NODE_BY_STATE: dict[str, str] = {
     SessionState.PRESCRIBING.value: "prescribing",
 }
 
-_NODE_NAMES = list(NODE_BY_STATE.values()) + ["inquiry_greet", "default_chat"]
+_NODE_NAMES = (
+    list(NODE_BY_STATE.values())
+    + ["inquiry_greet", "default_chat", "handle_medical_record"]
+)
 
 
 def route_entry(state: dict[str, Any]) -> str:
-    """入口路由：DIAGNOSIS + PRESCRIBE 特判；未知状态兜底 default_chat"""
+    """入口路由：病历处理节点优先；DIAGNOSIS+PRESCRIBE 特判；未知状态兜底"""
+    # 病历上传/重传：仅当 urls 是「新病历」（与上次处理过的不同）才走病历处理节点。
+    # 同批 urls 重发（前端每轮重复带 urls）→ 走正常状态节点，
+    # 让 collecting_basic 等正确捕获用户确认/纠正。
+    urls = state.get("request_medical_record_urls")
+    if urls:
+        prev_urls = (state.get("offline_medical_record") or {}).get("_processed_urls")
+        if not prev_urls or list(urls) != list(prev_urls):
+            return "handle_medical_record"
     current = state.get("state")
+    # 病历待确认：上一轮展示了病历信息，本轮处理确认/修改（COLLECTING_BASIC 自行处理）
+    if state.get("med_record_pending_confirm") and current != SessionState.COLLECTING_BASIC.value:
+        return "handle_medical_record"
+    # 用户明确表达重新上传病历（未带图）→ 引导上传
+    if _is_reupload_record_intent(state.get("request_message", "")):
+        return "handle_medical_record"
     action = state.get("request_action")
     # 对应 _handle_by_state:146-151 特判：DIAGNOSIS 状态 + PRESCRIBE 动作 → 直接开方
     if current == SessionState.DIAGNOSIS.value and action == "PRESCRIBE":
@@ -294,15 +449,19 @@ def route_after_collecting(state: dict[str, Any]) -> str:
 
 
 def route_after_inquiry(state: dict[str, Any]) -> str:
-    """inquiry 后：检测到支付 → 初步辨证；否则 END"""
-    if state.get("request_paid") and state.get("request_hos_sick_info") is not None:
+    """inquiry 后：paid=true 即转初步辨证（无需就诊人，无就诊人由该节点追问）；否则 END"""
+    if state.get("request_paid"):
         return "preliminary_diagnosis"
     return END
 
 
 def route_after_uploading(state: dict[str, Any]) -> str:
-    """uploading_images 后：有图 → 辨证；否则 END"""
-    if state.get("request_tongue_urls") or state.get("request_face_urls"):
+    """uploading_images 后：舌面照已有且系统问诊全部覆盖 → 辨证；否则 END"""
+    has_photos = bool(
+        state.get("request_tongue_urls") or state.get("request_face_urls")
+        or state.get("tongue_analysis") or state.get("face_analysis")
+    )
+    if has_photos and _systemic_done(state.get("inquiry_progress") or {}):
         return "diagnosis"
     return END
 
@@ -327,90 +486,18 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
     # COLLECTING_BASIC：收集基础信息（性别/年龄/过敏史/既往史）
     # ----------------------------------------------------------
     async def collecting_basic(state: dict[str, Any]) -> dict:
-        """收集基础信息：检测线下病历上传 → LLM 对话 → 提取字段 → 自动标"无" → 检查四字段"""
+        """收集基础信息：LLM 对话 → 提取字段 → 自动标"无" → 检查四字段
+
+        病历上传/重传由 handle_medical_record 节点统一处理（含首次上传），
+        本节点只负责对话收集与放行。
+        """
         collected: dict = dict(state.get("patient_info") or {})
         response_data = ResponseData()
         med_pending = state.get("med_record_pending_confirm", False)
-        skip_post_processing = False  # 病历刚提取时跳过 auto-fill 和 transition
         updates: dict[str, Any] = {}
 
-        # 0. 检测用户是否上传了线下病历照片
-        oss_urls = state.get("request_medical_record_urls") or []
-        has_uploaded_record = bool(oss_urls)
-        medical_context = ""
-
-        if has_uploaded_record:
-            logger.info("检测到线下病历上传: %s", oss_urls)
-            record_data = await analyze_medical_record(oss_urls[0], orchestrator)
-            if record_data.get("summary"):
-                logger.info("病历分析摘要: %s", record_data["summary"])
-
-            # 从病历分析中提取所有信息 -> 写入 collected
-            changed_med = False
-            if record_data.get("patient_gender"):
-                collected["gender"] = record_data["patient_gender"]
-                changed_med = True
-                logger.info("从病历提取性别: %s", record_data["patient_gender"])
-            if record_data.get("patient_age"):
-                age_raw = record_data["patient_age"]
-                try:
-                    collected["age"] = int(age_raw)
-                except (ValueError, TypeError):
-                    collected["age"] = age_raw
-                changed_med = True
-                logger.info("从病历提取年龄: %s", collected["age"])
-            if record_data.get("allergy_history"):
-                collected["allergy_history"] = record_data["allergy_history"]
-                changed_med = True
-                logger.info("从病历提取过敏史: %s", record_data["allergy_history"])
-            if record_data.get("past_medical_history"):
-                collected["past_medical_history"] = record_data["past_medical_history"]
-                changed_med = True
-                logger.info("从病历提取既往史: %s", record_data["past_medical_history"])
-            if record_data.get("chief_complaint"):
-                collected["chief_complaint"] = record_data["chief_complaint"]
-                changed_med = True
-                logger.info("从病历提取主诉: %s", record_data["chief_complaint"])
-
-            if changed_med:
-                updates["patient_info"] = collected
-
-            # 标记需要用户确认（下一轮会读到）
-            updates["med_record_pending_confirm"] = True
-            updates["offline_medical_record"] = record_data
-
-            # 构建病历完整上下文，供 LLM 向用户展示并请求确认
-            ctx_parts = [
-                "患者已上传线下病历照片，以下是提取到的信息，请向患者展示并询问是否需要修改或补充。"
-            ]
-            gender_display = "男" if record_data.get("patient_gender") == "male" else (
-                        record_data.get("patient_gender") or "")
-            if gender_display:
-                ctx_parts.append(f"- 性别: {gender_display}")
-            if record_data.get("patient_age"):
-                ctx_parts.append(f"- 年龄: {record_data['patient_age']}岁")
-            if record_data.get("chief_complaint"):
-                ctx_parts.append(f"- 主诉: {record_data['chief_complaint']}")
-            if record_data.get("current_symptoms"):
-                ctx_parts.append(f"- 当前症状: {record_data['current_symptoms']}")
-            if record_data.get("allergy_history"):
-                ctx_parts.append(f"- 过敏史: {record_data['allergy_history']}")
-            if record_data.get("past_medical_history"):
-                ctx_parts.append(f"- 既往史: {record_data['past_medical_history']}")
-            if record_data.get("diagnosis"):
-                ctx_parts.append(f"- 诊断: {record_data['diagnosis']}")
-            if record_data.get("medications"):
-                ctx_parts.append(f"- 用药: {record_data['medications']}")
-            if record_data.get("summary"):
-                ctx_parts.append(f"- 摘要: {record_data['summary']}")
-            medical_context = "\n".join(ctx_parts)
-            skip_post_processing = True  # 本轮只展示信息请求确认，不做后续处理
-
-        system_prompt = build_system_prompt(SessionState.COLLECTING_BASIC, collected)
-        if medical_context:
-            system_prompt = f"{system_prompt}\n\n## 线下病历信息\n{medical_context}"
-
         # 1. LLM 自然对话
+        system_prompt = build_system_prompt(SessionState.COLLECTING_BASIC, collected)
         messages = await build_chat_messages(
             system_prompt, state, state.get("request_message", ""), SessionState.COLLECTING_BASIC
         )
@@ -428,52 +515,33 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 ],
             )
             if result:
-                if result.gender:
-                    collected["gender"] = result.gender
-                    changed = True
-                if result.age:
-                    collected["age"] = result.age
-                    changed = True
-                if (result.allergy_history not in (None, "")
-                        and "过敏" in state.get("request_message", "")):
-                    collected["allergy_history"] = result.allergy_history
-                    changed = True
-                if result.past_medical_history not in (None, ""):
-                    has_kw = any(
-                        kw in state.get("request_message", "")
-                        for kw in ["既往", "病史", "疾病", "手术", "住院"]
-                    )
-                    if has_kw:
-                        collected["past_medical_history"] = result.past_medical_history
-                        changed = True
-                if result.chief_complaint:
-                    collected["chief_complaint"] = result.chief_complaint
-                    changed = True
+                changed = _apply_extracted_basic_fields(
+                    collected, result, state.get("request_message", "")
+                )
         except Exception as e:
             logger.debug("基础信息提取跳过: %s", e)
 
-        # 3. LLM 明确询问了但用户未答 → 主动标"无"（病历刚提取本轮跳过）
-        if not skip_post_processing:
-            missing_allergy = "allergy_history" not in collected
-            missing_past = "past_medical_history" not in collected
-            if missing_allergy or missing_past:
-                user_msg = state.get("request_message", "")
-                llm_asked_allergy = ("过敏" in llm_response
-                                     and ("有" in llm_response or "史" in llm_response))
-                llm_asked_past = any(
-                    t in llm_response for t in ["过什么病", "手术", "疾病", "住院", "既往"]
-                )
-                user_answered_allergy = "过敏" in user_msg
-                user_answered_past = any(
-                    t in user_msg for t in ["既往", "病史", "疾病", "手术", "住院"]
-                )
+        # 3. LLM 明确询问了但用户未答 → 主动标"无"
+        missing_allergy = "allergy_history" not in collected
+        missing_past = "past_medical_history" not in collected
+        if missing_allergy or missing_past:
+            user_msg = state.get("request_message", "")
+            llm_asked_allergy = ("过敏" in llm_response
+                                 and ("有" in llm_response or "史" in llm_response))
+            llm_asked_past = any(
+                t in llm_response for t in ["过什么病", "手术", "疾病", "住院", "既往"]
+            )
+            user_answered_allergy = "过敏" in user_msg
+            user_answered_past = any(
+                t in user_msg for t in ["既往", "病史", "疾病", "手术", "住院", "得过", "大病"]
+            )
 
-                if missing_allergy and llm_asked_allergy and not user_answered_allergy:
-                    collected["allergy_history"] = "无"
-                    changed = True
-                if missing_past and llm_asked_past and not user_answered_past:
-                    collected["past_medical_history"] = "无"
-                    changed = True
+            if missing_allergy and llm_asked_allergy and not user_answered_allergy:
+                collected["allergy_history"] = "无"
+                changed = True
+            if missing_past and llm_asked_past and not user_answered_past:
+                collected["past_medical_history"] = "无"
+                changed = True
 
         if changed:
             updates["patient_info"] = collected
@@ -498,22 +566,17 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             or ("病历" in llm_response and ("处方" in llm_response or "记录" in llm_response))
             or ("去医院" in llm_response and any(t in llm_response for t in ["看", "看过"]))
         )
-        if asked_offline and not has_uploaded_record:
+        if asked_offline:
             response_data.need_medical_record = True
 
         # 返回已收集的主诉（若有）
         response_data.chief_complaint = collected.get("chief_complaint")
 
-        # 5. 上一轮已设病历确认标记 → 本轮清除（仅当本轮没有新上传时，否则再设 True）
-        if med_pending and not has_uploaded_record:
+        # 5. 上一轮已设病历确认标记 → 本轮清除
+        #    （病历展示轮设置标记；本节点处理 COLLECTING_BASIC 下的确认/修改，非该状态由
+        #     handle_medical_record 的确认分支清除）
+        if med_pending:
             updates["_deleted_fields"] = ["med_record_pending_confirm"]
-
-        # 6. 病历刚提取一轮（待用户确认）→ 只展示不前进
-        if skip_post_processing:
-            updates["response_text"] = llm_response
-            updates["response_action"] = ActionType.COLLECT_BASIC_INFO
-            updates["response_data"] = response_data
-            return updates
 
         # 四个字段全部收齐才前进（拒绝空字符串和 None）
         if has_enough_patient_info(collected):
@@ -551,12 +614,13 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
     # INQUIRY：问诊阶段（持续收集主诉和症状）
     # ----------------------------------------------------------
     async def inquiry(state: dict[str, Any]) -> dict:
-        """问诊阶段：持续收集主诉和症状；检测支付 → 转初步辨证"""
+        """问诊阶段（付费前）：主诉链路驱动——识别主诉 → 按链路条件追问 → 引导付费"""
         chief_complaint = state.get("chief_complaint") or ""
 
-        # 检测支付确认：需要 paid=true 且 hos_sick_info 同时存在
+        # 检测支付确认：paid=true 即视为已付费（不再要求 hos_sick_info 同时存在；
+        # 没确认就诊人时由 PRELIMINARY_DIAGNOSIS/SELECTING_PATIENT 追问 need_select=true）
         request_paid = state.get("request_paid")
-        payment_detected = bool(request_paid) and state.get("request_hos_sick_info") is not None
+        payment_detected = bool(request_paid)
 
         system_prompt = build_system_prompt(
             SessionState.INQUIRY,
@@ -572,13 +636,21 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         if tcm_ctx:
             system_prompt = f"{system_prompt}\n\n{tcm_ctx}"
 
+        # 追加问诊进度（主诉链路是否已问清）
+        progress = dict(state.get("inquiry_progress") or {})
+        chain_done = "是" if progress.get(CHIEF_COMPLAINT_DIMENSION) else "否"
+        system_prompt += (
+            f"\n\n## 问诊进度\n- 主诉链路是否已问清：{chain_done}\n"
+            "- 主诉链路核心问题问清后，请在回复中自然引导付费。"
+        )
+
         # LLM 对话收集症状（带知识库上下文和历史）
         messages = await build_chat_messages(
             system_prompt, state, state.get("request_message", ""), SessionState.INQUIRY
         )
         llm_response = await orchestrator.chat(messages)
 
-        # 提取结构化症状信息（带容错：LLM 偶尔会胡诌函数名）
+        # 提取结构化症状信息 + 问诊进度（带容错：LLM 偶尔会胡诌函数名）
         symptom_result = None
         try:
             symptom_result = await orchestrator.ainvoke_structured(
@@ -612,24 +684,31 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 "accompanying_symptoms": symptom_result.accompanying_symptoms,
             }
             updates["inquiry"] = inquiry_data
+            # 合并问诊进度（主诉链路覆盖）
+            if symptom_result.covered_dimensions:
+                progress.update({d: True for d in symptom_result.covered_dimensions})
+                updates["inquiry_progress"] = progress
 
         # 检测到支付 → 转入初步辨证（响应交给 preliminary_diagnosis 节点产出）
         if payment_detected:
             # 标记会话为已付费
             updates["paid"] = True
             # 保存就诊人信息（process_chat 已 model_dump 为 dict）
-            updates["hos_sick_info"] = state["request_hos_sick_info"]
+            # 有就诊人才写入（paid=true 不带就诊人时由初步辨证追问；不写 None 避免 Redis 报错）
+            if state.get("request_hos_sick_info"):
+                updates["hos_sick_info"] = state["request_hos_sick_info"]
             updates["state"] = SessionState.PRELIMINARY_DIAGNOSIS.value
             return updates
 
-        # 未支付：继续问诊，检测是否已引导付费
+        # 未支付：继续问诊，主诉链路问清 → 引导付费
         response_data = ResponseData()
         # 返回本轮已收集的主诉和问诊信息
         response_data.chief_complaint = chief_complaint or None
         latest_inquiry = inquiry_data if symptom_result else state.get("inquiry", {})
         if latest_inquiry:
             response_data.inquiry_json = InquiryJson(**latest_inquiry)
-        if any(kw in llm_response for kw in ["付费", "支付", "费用"]):
+        chain_done_now = bool(symptom_result and symptom_result.chief_complaint_done)
+        if chain_done_now or any(kw in llm_response for kw in ["付费", "支付", "费用"]):
             response_data.need_pay = True
 
         updates["response_text"] = llm_response
@@ -648,10 +727,7 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         patient_gender = patient_info.get("gender") if patient_info else None
         patient_age = patient_info.get("age") if patient_info else None
 
-        query = chief_complaint or request_message
-
-        # 匹配候选证型（tcm_matcher 表内硬约束，防止 LLM 编造表外证型）
-        candidate_syndromes = [s["name"] for s in tcm_matcher.match_syndromes(query, top_k=5)]
+        query = _build_diagnosis_query(state, chief_complaint)
 
         # 双库检索（带上性别和年龄提高命中率）
         knowledge_context = await retrieve_knowledge(
@@ -662,13 +738,16 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             age=patient_age,
         )
 
-        # 构建初步辨证提示词（含候选证型约束）
+        # 全列表词汇表（LLM 必须从中选病名/证型）
+        taxonomy_text = tcm_matcher.format_full_taxonomy()
+
+        # 构建初步辨证提示词（含全列表选择约束）
         diagnosis_prompt = build_diagnosis_prompt(
             patient_info=patient_info,
             chief_complaint=chief_complaint or request_message,
             inquiry_info=state.get("inquiry", {}),
             knowledge_context=knowledge_context,
-            candidate_syndromes=candidate_syndromes,
+            taxonomy_text=taxonomy_text,
         )
 
         # 追加详细辨病辨证参考
@@ -740,34 +819,42 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             )
             return updates
 
-        # 没有就诊人信息（不应发生）→ 转入就诊人选择
+        # 没有就诊人信息（付费后未选择就诊人）→ 转入就诊人选择，追问 need_select=true
         updates["state"] = SessionState.SELECTING_PATIENT.value
 
         response = (
             f"根据您提供的信息，初步分析如下：\n\n"
             f"辨证：{diagnosis_dict.get('syndrome', '待辨证')}\n"
-            f"{diagnosis_dict.get('analysis', '')}"
+            f"{diagnosis_dict.get('analysis', '')}\n\n"
+            "请选择本次问诊的就诊人。"
         )
         updates["response_text"] = response
         updates["response_action"] = ActionType.SELECT_PATIENT
-        updates["response_data"] = ResponseData()
+        updates["response_data"] = ResponseData(need_select=True)
         return updates
 
     # ----------------------------------------------------------
     # SELECTING_PATIENT：选择就诊人（校验后端传入的就诊人信息）
     # ----------------------------------------------------------
     async def selecting_patient(state: dict[str, Any]) -> dict:
-        """选择就诊人：对比 AI 收集的基础信息与后端选择的就诊人，请求用户确认"""
-        # 优先取请求中的，否则从 session 读取支付时已保存的
+        """选择就诊人：比对收集信息与选定就诊人
+
+        规则：
+          - 无就诊人信息（付费后未选）→ 追问 need_select=true
+          - action=SELECT_PATIENT → 确定/切换就诊人，直接比对；不一致 → need_select=true 待确认
+          - action=CHAT 且消息修改了收集数据（如"年龄是35岁"）→ 更新收集数据并重比
+          - action=CHAT 待确认中 → 语义确认/否认（confirm 放行 / disagree 重新选择）
+        """
+        # 选定就诊人（request 优先，否则 session）
         if state.get("request_hos_sick_info"):
             confirmed = dict(state["request_hos_sick_info"])
         else:
             session_confirmed = state.get("hos_sick_info")
             if not session_confirmed:
                 return {
-                    "response_text": "请选择就诊人信息。",
+                    "response_text": "请选择本次问诊的就诊人。",
                     "response_action": ActionType.SELECT_PATIENT,
-                    "response_data": ResponseData(),
+                    "response_data": ResponseData(need_select=True),
                 }
             confirmed = dict(session_confirmed)
 
@@ -779,119 +866,224 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         if not confirmed.get("past_medical_history") and collected.get("past_medical_history"):
             confirmed["past_medical_history"] = collected["past_medical_history"]
 
-        # 检查是否已有待确认的比对
+        user_msg = state.get("request_message", "")
+        action = state.get("request_action", "CHAT")
         pending = state.get("patient_select_pending", False)
+        mismatch_reason = state.get("mismatch_reason") or "信息不一致"
+        updates: dict[str, Any] = {}
 
-        if pending:
-            # 用户已看到比对结果，本轮是用户的确认/否认回复
-            user_msg = state.get("request_message", "")
-            # 语义分析：用 LLM 理解用户真实意图（代替关键词匹配）
-            mismatch_reason = state.get("mismatch_reason") or "信息不一致"
-            action, analysis = await orchestrator.confirm_patient_info(
+        # ① 用户消息若修改了「收集数据」→ 更新（用户修改为准），后续用新数据重比
+        collected_changed = False
+        try:
+            result = await orchestrator.ainvoke_structured(
+                ExtractedPatientInfo,
+                [
+                    {"role": "system", "content": build_basic_info_extraction_prompt()},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+            if result:
+                collected_changed = _apply_extracted_basic_fields(collected, result, user_msg)
+        except Exception as e:
+            logger.debug("就诊人收集数据修改提取跳过: %s", e)
+        if collected_changed:
+            updates["patient_info"] = collected
+
+        # ② 分支判定：SELECT_PATIENT（确定/切换）→ 直接比对；
+        #    CHAT 修改了收集数据 → 重比；CHAT 待确认中 → 语义确认/否认；否则首次比对
+        if action == ActionType.SELECT_PATIENT.value or collected_changed:
+            is_match, reason = await orchestrator.match_patient_info(collected, confirmed)
+        elif pending:
+            semantic, analysis = await orchestrator.confirm_patient_info(
                 collected, confirmed, mismatch_reason, user_msg
             )
-
-            if action == "disagree":
-                # 用户不同意 → 清除 pending，让前端重新选择
-                return {
-                    "_deleted_fields": ["patient_select_pending"],
-                    "response_text": "已取消当前选择，请重新选择就诊人。",
-                    "response_action": ActionType.SELECT_PATIENT,
-                    "response_data": ResponseData(need_select=True),
-                }
-
-            if action == "confirm":
-                # 用户已确认 → 以 hos_sick_info 为准，更新 patient_info
-                updated_info = dict(collected)
+            if semantic == "disagree":
+                # 用户不同意 → 清除 pending，让前端重新选择（need_select=true）
+                updates["_deleted_fields"] = ["patient_select_pending"]
+                updates["response_text"] = "已取消当前选择，请重新选择就诊人。"
+                updates["response_action"] = ActionType.SELECT_PATIENT
+                updates["response_data"] = ResponseData(need_select=True)
+                return updates
+            if semantic == "confirm":
+                # 用户确认 → 以选定就诊人为准，更新收集数据后放行
+                updates["_deleted_fields"] = ["patient_select_pending"]
                 for key in ("gender", "age", "allergy_history", "past_medical_history"):
                     if confirmed.get(key) is not None:
-                        updated_info[key] = confirmed[key]
-                response = f"就诊人已确认：{confirmed.get('name', '')}，请拍摄并上传舌照和面照。"
-                return {
-                    "_deleted_fields": ["patient_select_pending"],
-                    "patient_info_confirmed": confirmed,
-                    "patient_info": updated_info,
-                    "state": SessionState.UPLOADING_IMAGES.value,
-                    "response_text": response,
-                    "response_action": ActionType.UPLOAD_IMAGES,
-                    "response_data": ResponseData(need_upload_image=True),
-                }
-
+                        collected[key] = confirmed[key]
+                updates["patient_info_confirmed"] = confirmed
+                updates["patient_info"] = collected
+                updates["state"] = SessionState.UPLOADING_IMAGES.value
+                updates["response_text"] = (
+                    f"就诊人已确认：{confirmed.get('name', '')}，请拍摄并上传舌照和面照。"
+                )
+                updates["response_action"] = ActionType.UPLOAD_IMAGES
+                updates["response_data"] = ResponseData(need_upload_image=True)
+                return updates
             # 表达不明确 → 保持状态，简短提示
-            return {
-                "response_text": (
-                    f"就诊人：{confirmed.get('name', '')}，{confirmed.get('gender', '')}，"
-                    f"{confirmed.get('age', '')}岁。请确认是否以上述就诊人信息为准？"
-                ),
-                "response_action": ActionType.SELECT_PATIENT,
-                "response_data": ResponseData(patient_mismatch=True),
-            }
-
-        # --- 首次进入：对比信息 ---
-        is_match, reason = await orchestrator.match_patient_info(collected, confirmed)
-
-        if not is_match:
-            # 有不一致 → 展示对比，请求确认
-            collected_name = f"{collected.get('age', '?')}岁" if collected.get("age") else "?"
-            collected_gender = collected.get("gender", "?")
-            confirmed_gender = confirmed.get("gender", "?")
-            confirmed_age = confirmed.get("age", "?")
-
-            response = (
-                f"您前面提供的就诊信息为：{collected_gender}，{collected_name}。"
-                f"您选择的就诊人信息为：{confirmed_gender}，{confirmed_age}岁。"
+            updates["response_text"] = (
+                f"就诊人：{confirmed.get('name', '')}，{confirmed.get('gender', '')}，"
+                f"{confirmed.get('age', '')}岁。请确认是否以上述就诊人信息为准？"
             )
-            return {
-                "patient_mismatch": True,
-                "patient_select_pending": True,
-                "mismatch_reason": reason,
-                "response_text": response,
-                "response_action": ActionType.SELECT_PATIENT,
-                "response_data": ResponseData(
-                    patient_mismatch=True, mismatch_reason=reason,
-                ),
-            }
+            updates["response_action"] = ActionType.SELECT_PATIENT
+            updates["response_data"] = ResponseData(patient_mismatch=True)
+            return updates
+        else:
+            # 首次进入（无待确认）→ 对比信息
+            is_match, reason = await orchestrator.match_patient_info(collected, confirmed)
 
-        # 完全一致 → 直接放行
-        response = f"就诊人确认无误：{confirmed.get('name', '')}，请拍摄并上传舌照和面照。"
-        return {
-            "patient_info_confirmed": confirmed,
-            "state": SessionState.UPLOADING_IMAGES.value,
-            "response_text": response,
-            "response_action": ActionType.UPLOAD_IMAGES,
-            "response_data": ResponseData(need_upload_image=True),
-        }
+        # ③ 比对结果处理（SELECT_PATIENT / 修改后重比 / 首次进入 共用）
+        if is_match:
+            # 一致 → 确认放行（不追问）
+            updates["patient_info_confirmed"] = confirmed
+            updates["state"] = SessionState.UPLOADING_IMAGES.value
+            updates["response_text"] = (
+                f"就诊人确认无误：{confirmed.get('name', '')}，请拍摄并上传舌照和面照。"
+            )
+            updates["response_action"] = ActionType.UPLOAD_IMAGES
+            updates["response_data"] = ResponseData(need_upload_image=True)
+            if pending:
+                updates["_deleted_fields"] = ["patient_select_pending"]
+            return updates
+
+        # 不一致 → 展示对比，待确认（need_select=true，可切换或修改收集数据）
+        collected_name = f"{collected.get('age', '?')}岁" if collected.get("age") else "?"
+        response = (
+            f"您前面提供的就诊信息为：{collected.get('gender', '?')}，{collected_name}。"
+            f"您选择的就诊人信息为：{confirmed.get('gender', '?')}，"
+            f"{confirmed.get('age', '?')}岁。"
+        )
+        updates["patient_mismatch"] = True
+        updates["patient_select_pending"] = True
+        updates["mismatch_reason"] = reason
+        updates["response_text"] = (
+            response + "\n您可以通过「选择就诊人」切换，或直接告知我正确的信息以修改。"
+        )
+        updates["response_action"] = ActionType.SELECT_PATIENT
+        updates["response_data"] = ResponseData(
+            patient_mismatch=True, mismatch_reason=reason, need_select=True,
+        )
+        return updates
 
     # ----------------------------------------------------------
     # UPLOADING_IMAGES：上传舌照/面照
     # ----------------------------------------------------------
     async def uploading_images(state: dict[str, Any]) -> dict:
-        """上传舌照/面照阶段；有图则分析并转 DIAGNOSIS（辨证由 diagnosis 节点执行）"""
+        """付费后：系统问诊表推进 + 舌面照分析；全部维度覆盖且照片已传 → 转 DIAGNOSIS"""
         tongue_urls = state.get("request_tongue_urls") or []
         face_urls = state.get("request_face_urls") or []
+        # 照片"已有"= 本轮新传 或 历史轮已分析持久化（跨轮系统问诊时照片已存，勿重复引导上传）
+        has_photos = bool(
+            tongue_urls or face_urls
+            or state.get("tongue_analysis") or state.get("face_analysis")
+        )
+        progress = dict(state.get("inquiry_progress") or {})
+        updates: dict[str, Any] = {}
 
+        # 1. 本轮带舌面照 → 分析并写入（不立即转诊断）
         if tongue_urls or face_urls:
-            # 分别单独分析舌照和面照
             tongue_result = await analyze_tongue_images(
                 tongue_urls, orchestrator,
                 patient_context=state.get("chief_complaint", ""),
             )
             face_result = await analyze_face_images(face_urls, orchestrator)
+            updates["image_urls"] = tongue_urls + face_urls
+            updates["tongue_analysis"] = tongue_result
+            updates["face_analysis"] = face_result
 
-            # 分析结果写入 state，diagnosis 节点直接读取（快照 trick 自然消失）
+        # 2. 系统问诊推进（未全部覆盖）
+        if not _systemic_done(progress):
+            system_prompt = build_system_prompt(
+                SessionState.UPLOADING_IMAGES,
+                state.get("patient_info"),
+                state.get("chief_complaint") or "",
+                paid=True,
+            )
+            covered = [d for d in SYSTEMIC_DIMENSIONS if progress.get(d)]
+            pending = [d for d in SYSTEMIC_DIMENSIONS if not progress.get(d)]
+            asked_dim = pending[0] if pending else None
+            system_prompt += (
+                "\n\n## 问诊进度\n"
+                f"- 已覆盖维度：{covered or '无'}\n"
+                f"- 待问维度：{pending}\n"
+                f"- 本轮**必须**按顺序询问待问维度中的第一个（{asked_dim}），"
+                "不要跳问其他维度；用户回答后判断该维度是否已覆盖。"
+            )
+            messages = await build_chat_messages(
+                system_prompt, state, state.get("request_message", ""),
+                SessionState.UPLOADING_IMAGES,
+            )
+            llm_response = await orchestrator.chat(messages)
+
+            # 结构化提取：症状 + 维度覆盖
+            symptom_result = None
+            try:
+                symptom_result = await orchestrator.ainvoke_structured(
+                    SymptomExtraction,
+                    [
+                        {"role": "system", "content": build_symptom_extraction_prompt()},
+                        {"role": "user", "content": state.get("request_message", "")},
+                        {"role": "user", "content": llm_response},
+                    ],
+                )
+            except Exception as e:
+                logger.warning("系统问诊症状提取失败: %s", e)
+
+            # 合并维度文本进 inquiry dict + 进度
+            inquiry_data = dict(state.get("inquiry") or {})
+            if symptom_result:
+                # 只把「本轮新覆盖」的维度文本写入 inquiry，已覆盖维度不覆盖
+                # （防止后期轮次误把更早的优质数据覆盖成"未明确提及…"）
+                # 且只接受顺序不晚于本轮应问维度的覆盖（防止 LLM 过度报告跳步）
+                newly = [
+                    d for d in symptom_result.covered_dimensions
+                    if d in SYSTEMIC_DIMENSIONS
+                    and (asked_dim is None
+                         or SYSTEMIC_DIMENSIONS.index(d) <= SYSTEMIC_DIMENSIONS.index(asked_dim))
+                    and not progress.get(d)
+                ]
+                progress.update({d: True for d in newly})
+                if symptom_result.dimension_findings:
+                    for dim, txt in symptom_result.dimension_findings.items():
+                        if txt and dim in newly:
+                            inquiry_data[dim] = txt
+                if symptom_result.symptoms:
+                    existing = inquiry_data.get("symptoms") or []
+                    fresh = [s for s in symptom_result.symptoms if s not in existing]
+                    if fresh:
+                        inquiry_data["symptoms"] = existing + fresh
+                if symptom_result.duration:
+                    inquiry_data["duration"] = symptom_result.duration
+                if symptom_result.accompanying_symptoms:
+                    inquiry_data["accompanying_symptoms"] = symptom_result.accompanying_symptoms
+            updates["inquiry"] = inquiry_data
+            updates["inquiry_progress"] = progress
+
+            # 全部维度覆盖且照片已有 → 转诊断（响应交给 diagnosis 节点产出）
+            if _systemic_done(progress) and has_photos:
+                updates["state"] = SessionState.DIAGNOSIS.value
+            response_data = ResponseData()
+            if not has_photos:
+                response_data.need_upload_image = True
+            updates["response_text"] = llm_response
+            updates["response_action"] = ActionType.CHAT
+            updates["response_data"] = response_data
+            return updates
+
+        # 3. 系统问诊已全部覆盖
+        if not has_photos:
             return {
-                "image_urls": tongue_urls + face_urls,
-                "tongue_analysis": tongue_result,
-                "face_analysis": face_result,
-                "state": SessionState.DIAGNOSIS.value,
+                "response_text": (
+                    "系统问诊已基本完成，请拍摄清晰的舌照和面照，"
+                    "确保光线充足、对焦清晰。"
+                ),
+                "response_action": ActionType.CHAT,
+                "response_data": ResponseData(need_upload_image=True),
             }
-
-        # 无图片，引导上传
-        return {
-            "response_text": "请拍摄清晰的舌照和面照，确保光线充足、对焦清晰。",
-            "response_action": ActionType.CHAT,
-            "response_data": ResponseData(need_upload_image=True),
-        }
+        updates["state"] = SessionState.DIAGNOSIS.value
+        updates["response_text"] = "好的，问诊信息与舌面照已收集齐全，下面为您进行正式辨证。"
+        updates["response_action"] = ActionType.DIAGNOSIS
+        updates["response_data"] = ResponseData()
+        return updates
 
     # ----------------------------------------------------------
     # DIAGNOSIS：辨证阶段
@@ -1037,14 +1229,18 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         if existing and existing.get("drugList") and not reuploaded:
             prescription = existing
         else:
-            # 处方阶段也检索知识库（带上性别年龄提高命中率）
-            kb_type = STATE_KNOWLEDGE_BASE.get(SessionState.PRESCRIBING, "general")
-            knowledge_context = await retrieve_knowledge(
-                query=chief_complaint or request_message,
-                knowledge_base=kb_type,
-                top_k=3,
-                gender=patient_gender,
-                age=patient_age,
+            # RAG 检索 expert 知识库相似病例（query=疾病/证型/主诉/追问，
+            # 检索后按 性别精确 + 年龄±10 过滤）
+            rag_query = _build_prescription_query(state, diagnosis, chief_complaint)
+            knowledge_context = format_retrieval_context(
+                await retrieve_with_filter(
+                    rag_query,
+                    gender=patient_gender,
+                    age=patient_age,
+                    age_range=10,
+                    top_k=3,
+                    fetch_k=30,
+                )
             )
 
             # 获取推荐主方（从 tcm_syndrome.recommended_formula）
@@ -1068,39 +1264,19 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                         diagnosis = {**diagnosis, "syndrome": fallback}
                         syndrome_name = fallback
 
-            # 获取相似历史处方案例（从 PrescriptionIndex，按性别年龄过滤）
-            similar_prescriptions: list[dict] = []
-            if prescription_index.loaded:
-                matched = prescription_index.lookup(
-                    disease_name, syndrome_name, top_k=3,
-                    gender=patient_gender, age=patient_age,
-                )
-                similar_prescriptions = [
-                    {
-                        "herbs": m.get("herbs", []),
-                        "dosage": m.get("dosage", ""),
-                        "age": m.get("age"),
-                        "gender": m.get("gender", ""),
-                    }
-                    for m in matched
-                ]
-
             # 调试日志
             logger.info(
-                "处方生成参考: disease=%s syndrome=%s base_formula=%s similar_cases=%d",
-                disease_name, syndrome_name,
-                base_formula or "(无)",
-                len(similar_prescriptions),
+                "处方生成参考: disease=%s syndrome=%s base_formula=%s rag_query=%s",
+                disease_name, syndrome_name, base_formula or "(无)", rag_query[:80],
             )
 
-            # 生成处方
+            # 生成处方（expert 库历史案例已含在 knowledge_context）
             prescription = await generate_prescription(
                 diagnosis=diagnosis,
                 chief_complaint=chief_complaint or request_message,
                 patient_info=patient_info,
                 knowledge_context=knowledge_context,
                 base_formula=base_formula,
-                similar_prescriptions=similar_prescriptions,
                 orchestrator=orchestrator,
             )
 
@@ -1147,11 +1323,98 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         return updates
 
     # ----------------------------------------------------------
+    # handle_medical_record：病历上传 / 重传 / 确认（任意状态下可触发）
+    # ----------------------------------------------------------
+    async def handle_medical_record(state: dict[str, Any]) -> dict:
+        """病历处理节点：多图分析基础信息并展示待确认；或处理确认/修改；或引导重新上传"""
+        urls = state.get("request_medical_record_urls") or []
+        collected: dict = dict(state.get("patient_info") or {})
+        user_msg = state.get("request_message", "")
+        updates: dict[str, Any] = {}
+
+        # ── 1. 本轮带病历图片：重新分析并展示，等待用户确认/修改 ──
+        if urls:
+            logger.info("检测到病历上传/重传（%d 张）: %s", len(urls), urls)
+            record_data = await analyze_medical_record(urls, orchestrator)
+            # 记录已处理的 urls（route_entry 据此区分"同批重发"与"新病历"）
+            record_data["_processed_urls"] = list(urls)
+            if _merge_record_basic_info(collected, record_data):
+                updates["patient_info"] = collected
+            # 标记待确认（下一轮据此处理确认/修改；COLLECTING_BASIC 下由 collecting_basic 处理）
+            updates["med_record_pending_confirm"] = True
+            updates["offline_medical_record"] = record_data
+
+            info_text = format_medical_record_basic_info(record_data)
+            system_prompt = (
+                "你是一位专业的中医男科智能体。患者刚刚上传/重新上传了线下病历照片，"
+                "以下是提取到的患者基础信息，请向患者展示。\n\n"
+                f"## 提取到的信息\n{info_text}\n\n"
+                "注意：\n"
+                "1. 只展示基础信息（姓名、性别、年龄、身高、职业、体重），"
+                "不要复述或询问病历中的具体病情、诊断、处方等内容。\n"
+                "2. 身高、体重、职业、姓名等没提取到就不用提及，也不要追问。\n"
+                "3. 如果性别或年龄没提取到，需要询问患者补充（这两项为就诊必需信息）。\n"
+                "4. 请询问患者以上信息是否有误：有误请直接告知正确的信息，确认无误可回复'确认'。"
+            )
+            llm_response = await orchestrator.chat([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg or "请核对病历信息"},
+            ])
+            updates["response_text"] = llm_response
+            updates["response_action"] = ActionType.COLLECT_BASIC_INFO
+            updates["response_data"] = ResponseData()
+            return updates
+
+        # ── 2. 用户明确表达重新上传病历（未带图）→ 引导上传 ──
+        if _is_reupload_record_intent(user_msg):
+            updates["response_text"] = (
+                "好的，您可以重新上传病历照片，支持一次上传多张。"
+                "上传后我会重新为您核对基本信息。"
+            )
+            updates["response_action"] = ActionType.CHAT
+            updates["response_data"] = ResponseData(need_medical_record=True)
+            return updates
+
+        # ── 3. 上一轮已展示病历信息 → 本轮处理确认/修改（用户修改为准）──
+        if state.get("med_record_pending_confirm"):
+            result = None
+            try:
+                result = await orchestrator.ainvoke_structured(
+                    ExtractedPatientInfo,
+                    [
+                        {"role": "system", "content": build_basic_info_extraction_prompt()},
+                        {"role": "user", "content": user_msg},
+                    ],
+                )
+            except Exception as e:
+                logger.debug("病历确认/修改提取跳过: %s", e)
+            changed = bool(result) and _apply_extracted_basic_fields(collected, result, user_msg)
+            if changed:
+                updates["patient_info"] = collected
+            updates["_deleted_fields"] = ["med_record_pending_confirm"]
+            updates["response_text"] = (
+                "好的，已按您的修改更新基本信息。" if changed
+                else "好的，基本信息确认无误，我们继续。"
+            )
+            updates["response_action"] = ActionType.CHAT
+            updates["response_data"] = ResponseData()
+            return updates
+
+        # 兜底（正常不应到达）
+        updates["response_text"] = "好的，您可以上传或重新上传病历照片，我来帮您核对基本信息。"
+        updates["response_action"] = ActionType.CHAT
+        updates["response_data"] = ResponseData(need_medical_record=True)
+        return updates
+
+    # ----------------------------------------------------------
     # default_chat：兜底对话
     # ----------------------------------------------------------
     async def default_chat(state: dict[str, Any]) -> dict:
         return {
-            "response_text": "您好，我是中医AI助手。请告诉我您的症状。",
+            "response_text": (
+                "您好，我是中医男科智能体，专注阳痿、早泄、男性不育不孕等男科问题。"
+                "请问有什么可以帮您？"
+            ),
             "response_action": ActionType.CHAT,
             "response_data": ResponseData(),
         }
@@ -1165,6 +1428,7 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         "diagnosis": diagnosis,
         "prescribing": prescribing,
         "inquiry_greet": inquiry_greet,
+        "handle_medical_record": handle_medical_record,
         "default_chat": default_chat,
     }
 
@@ -1199,6 +1463,7 @@ def build_consultation_graph(orchestrator: LLMOrchestrator):
         "diagnosis",
         "prescribing",
         "inquiry_greet",
+        "handle_medical_record",
         "default_chat",
     ):
         graph.add_edge(name, END)

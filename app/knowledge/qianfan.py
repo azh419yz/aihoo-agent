@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -189,6 +190,66 @@ async def retrieve(
         knowledge_base, query[:60], enhanced[:80], len(results),
     )
     return results[:top_k]
+
+
+def _parse_case_age_gender(text: str) -> tuple[str | None, int | None]:
+    """从 expert 库病例文本解析 性别/年龄
+
+    兼容新旧格式：'男｜33岁'、'女/38岁'、'患者: 33岁/男'。
+    Returns: (性别中文, 年龄)；无法解析返回 (None, None)
+    """
+    if not text:
+        return None, None
+    m = re.search(r'([男女])\s*[｜|/]\s*(\d+)\s*岁', text)
+    if m:
+        return m.group(1), int(m.group(2))
+    m = re.search(r'(\d+)\s*岁\s*[｜|/]\s*([男女])', text)
+    if m:
+        return m.group(2), int(m.group(1))
+    return None, None
+
+
+async def retrieve_with_filter(
+    query: str,
+    gender: str | None = None,
+    age: int | None = None,
+    age_range: int = 10,
+    top_k: int = 3,
+    fetch_k: int = 30,
+    syndromes: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """从 expert 知识库检索相似病例，检索后按 性别精确 + 年龄±age_range 过滤
+
+    RAG 检索是相似度，性别/年龄用检索后过滤硬性保证：
+      1. 先取 fetch_k 条候选
+      2. 解析每条病例的 性别/年龄，过滤：性别一致 + 年龄在 ±age_range 内
+      3. 过滤后取前 top_k（要求过滤时，无法解析性别/年龄的病例剔除）
+
+    Args:
+        query: 检索词（疾病/证型/主诉/追问）
+        gender: 患者性别（male/female）
+        age: 患者年龄
+        age_range: 年龄允许上下差（默认 10）
+        top_k: 过滤后返回条数
+        fetch_k: 先取的候选条数
+        syndromes: 可选，证型标签（增强查询）
+    """
+    results = await retrieve(
+        query, knowledge_base="expert", top_k=fetch_k, syndromes=syndromes
+    )
+    gender_cn = {"male": "男", "female": "女"}.get(gender or "")
+    filtered = []
+    for r in results:
+        g, a = _parse_case_age_gender(r.get("text") or "")
+        if gender_cn and g != gender_cn:
+            continue
+        if age is not None:
+            if a is None:
+                continue  # 要求年龄过滤时，无法解析的病例剔除
+            if abs(a - age) > age_range:
+                continue
+        filtered.append(r)
+    return filtered[:top_k]
 
 
 @retry(

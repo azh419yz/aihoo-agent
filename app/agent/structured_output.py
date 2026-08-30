@@ -20,8 +20,12 @@ class PatientConfirmAction(str, Enum):
 class ExtractedPatientInfo(BaseModel):
     """从对话中提取的患者基本信息"""
 
+    name: str | None = Field(default=None, description="姓名")
     gender: str | None = Field(default=None, description="性别: male/female")
     age: int | None = Field(default=None, description="年龄")
+    height: str | None = Field(default=None, description="身高（如'175cm'）")
+    occupation: str | None = Field(default=None, description="职业")
+    weight: str | None = Field(default=None, description="体重（如'70kg'）")
     allergy_history: str | None = Field(default=None, description="过敏史，患者说没有填'无'，否则填具体过敏原")
     past_medical_history: str | None = Field(default=None, description="既往史，患者说没有填'无'，否则填具体疾病")
     chief_complaint: str | None = Field(default=None, description="主诉")
@@ -37,13 +41,26 @@ class PatientMatchResult(BaseModel):
 
 
 class SymptomExtraction(BaseModel):
-    """从问诊中提取的症状信息"""
+    """从问诊中提取的症状信息 + 问诊维度进度"""
 
     symptoms: list[str] = Field(default_factory=list, description="已确认的症状列表")
     new_symptoms: list[str] = Field(default_factory=list, description="本轮新发现的症状")
     duration: str | None = Field(default=None, description="病程/持续时间")
     accompanying_symptoms: list[str] = Field(default_factory=list, description="伴随症状")
     key_findings: str = Field(default="", description="关键发现")
+
+    # ---- 问诊进度追踪 ----
+    covered_dimensions: list[str] = Field(
+        default_factory=list,
+        description="本轮已覆盖的问诊维度，取值：chief_complaint/sleep/diet/stool/urine/emotion/thermo",
+    )
+    dimension_findings: dict[str, str] = Field(
+        default_factory=dict,
+        description="各已覆盖维度的文本总结，如 {'sleep': '入睡难，多梦'}",
+    )
+    chief_complaint_done: bool = Field(
+        default=False, description="付费前主诉链路是否已问清（问清后应引导付费）"
+    )
 
     need_more_info: bool = Field(default=True, description="是否还需要更多信息")
     next_question: str = Field(default="", description="下一个应该问的问题方向")

@@ -38,7 +38,9 @@ docker-data/
 htmlcov/
 
 # base line 仓库不提交的目录/文件（源码与初始化数据之外）
-docs/
 tests/
+docs/
+tools/
+page/
 CLAUDE.md
 format.json

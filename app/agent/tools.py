@@ -76,21 +76,19 @@ async def generate_prescription(
         patient_info: dict[str, Any] | None = None,
         knowledge_context: str | None = None,
         base_formula: str | None = None,
-        similar_prescriptions: list[dict] | None = None,
         orchestrator: LLMOrchestrator | None = None,
 ) -> dict[str, Any]:
     """根据辨证结果生成处方
 
-    三层策略：推荐主方（tcm_syndrome）→ 历史处方案例（prescription_index）
-    → 知识库参考（百炼），LLM 只做局部调整。
+    参考来源：推荐主方（tcm_syndrome）→ 历史处方案例（expert 知识库检索，
+    经 性别+年龄±10 过滤，已含在 knowledge_context）→ 知识库参考。
 
     Args:
         diagnosis: 辨证结果（包含 disease, syndrome 等）
         chief_complaint: 主诉
         patient_info: 患者信息
-        knowledge_context: 知识库检索上下文
+        knowledge_context: 知识库检索上下文（含 expert 库相似病例）
         base_formula: 推荐主方名称（如"右归丸加减"），来自 tcm_syndrome.recommended_formula
-        similar_prescriptions: 相似历史处方案例列表，来自 PrescriptionIndex
         orchestrator: LLM 编排器实例
 
     Returns:
@@ -100,13 +98,11 @@ async def generate_prescription(
         orchestrator = LLMOrchestrator()
 
     prompt = build_prescription_prompt(
-
         diagnosis=diagnosis,
         chief_complaint=chief_complaint,
         patient_info=patient_info,
         knowledge_context=knowledge_context,
         base_formula=base_formula,
-        similar_prescriptions=similar_prescriptions,
     )
 
     result = await orchestrator.ainvoke_structured(

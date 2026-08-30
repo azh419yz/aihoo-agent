@@ -46,7 +46,7 @@ STATE_ACTIONS: dict[SessionState, list[ActionType]] = {
     SessionState.COLLECTING_BASIC: [ActionType.CHAT, ActionType.COLLECT_BASIC_INFO],
     SessionState.INQUIRY: [ActionType.CHAT],
     SessionState.PRELIMINARY_DIAGNOSIS: [ActionType.CHAT, ActionType.DIAGNOSIS],
-    SessionState.SELECTING_PATIENT: [ActionType.SELECT_PATIENT],
+    SessionState.SELECTING_PATIENT: [ActionType.SELECT_PATIENT, ActionType.CHAT],
     SessionState.UPLOADING_IMAGES: [ActionType.CHAT, ActionType.UPLOAD_IMAGES],
     SessionState.DIAGNOSIS: [ActionType.CHAT, ActionType.DIAGNOSIS, ActionType.PRESCRIBE],
     SessionState.PRESCRIBING: [ActionType.CHAT, ActionType.PRESCRIBE],
@@ -61,7 +61,7 @@ STATE_KNOWLEDGE_BASE: dict[SessionState, str] = {
     SessionState.SELECTING_PATIENT: "both",
     SessionState.UPLOADING_IMAGES: "both",
     SessionState.DIAGNOSIS: "both",
-    SessionState.PRESCRIBING: "both",
+    SessionState.PRESCRIBING: "expert",
 }
 
 
