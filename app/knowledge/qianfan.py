@@ -65,6 +65,14 @@ def _get_client() -> httpx.AsyncClient:
 # ============================================================
 
 
+def _gender_cn(gender: str | None) -> str | None:
+    """性别归一化为中文（male/female → 男/女；已是中文则保留）"""
+    if not gender:
+        return None
+    g = str(gender).strip()
+    return {"male": "男", "female": "女"}.get(g, g)
+
+
 def build_enhanced_query(
         query: str,
         kb_type: str = "general",
@@ -105,7 +113,7 @@ def build_enhanced_query(
         if syndromes:
             parts.append("证型：" + "、".join(syndromes[:3]))
         if gender:
-            parts.append("性别：" + ("男" if gender == "male" else "女"))
+            parts.append("性别：" + (_gender_cn(gender) or ""))
         if age is not None:
             parts.append(f"年龄：约{age}岁")
 
@@ -123,7 +131,7 @@ def build_enhanced_query(
 
         tags = (diseases or [])[:3] + (syndromes or [])[:3]
         if gender:
-            tags.append("男" if gender == "male" else "女")
+            tags.append(_gender_cn(gender) or "")
         if age is not None:
             tags.append(f"{age}岁")
         tag_str = "、".join(tags)
@@ -237,7 +245,7 @@ async def retrieve_with_filter(
     results = await retrieve(
         query, knowledge_base="expert", top_k=fetch_k, syndromes=syndromes
     )
-    gender_cn = {"male": "男", "female": "女"}.get(gender or "")
+    gender_cn = _gender_cn(gender)
     filtered = []
     for r in results:
         g, a = _parse_case_age_gender(r.get("text") or "")

@@ -25,8 +25,10 @@ from langgraph.graph import END, START, StateGraph
 from app.agent.orchestrator import LLMOrchestrator
 from app.agent.prompts import (
     build_basic_info_extraction_prompt,
+    build_choices_extraction_prompt,
     build_diagnosis_prompt,
     build_existing_diagnosis_display_prompt,
+    build_male_inquiry_sufficiency_prompt,
     build_symptom_extraction_prompt,
     build_system_prompt,
 )
@@ -34,12 +36,14 @@ from app.agent.state_machine import STATE_KNOWLEDGE_BASE, ActionType, SessionSta
 from app.agent.structured_output import (
     DiagnosisResult,
     ExtractedPatientInfo,
+    MaleInquirySufficiency,
+    QuestionChoices,
     SymptomExtraction,
 )
 from app.agent.tools import generate_prescription, retrieve_knowledge
 from app.knowledge.qianfan import format_retrieval_context, retrieve_with_filter
 from app.knowledge.tcm_matcher import tcm_matcher
-from app.models.chat_schema import InquiryJson, ResponseData
+from app.models.chat_schema import InquiryJson, QuestionChoice, ResponseData
 from app.multimodal.medical_record import analyze_medical_record, format_medical_record_basic_info
 from app.multimodal.tongue_face import analyze_face_images, analyze_tongue_images
 
@@ -183,6 +187,42 @@ _REUPLOAD_RECORD_KEYWORDS = ("重新上传", "重新传", "重传", "传错", "�
 _PHOTO_REUPLOAD_KEYWORDS = ("重新上传", "重新传", "重传", "重新发")
 
 
+async def _extract_choices(
+    orchestrator: LLMOrchestrator, user_msg: str, llm_response: str
+) -> list[QuestionChoice]:
+    """用专用结构化 model（QuestionChoices）让 LLM 判断并输出问答选项
+
+    返回选项块列表（每条含 title/type/options，多个封闭式问题拆多条）；
+    无选项返回 []。失败容错不阻断主流程。
+    """
+    try:
+        result = await orchestrator.ainvoke_structured(
+            QuestionChoices,
+            [
+                {"role": "system", "content": build_choices_extraction_prompt()},
+                {"role": "user", "content": user_msg},
+                {"role": "user", "content": llm_response},
+            ],
+        )
+        if result and result.choices:
+            return [c for c in result.choices if c.options]
+    except Exception as e:
+        logger.debug("问答选项提取跳过: %s", e)
+    return []
+
+
+async def _set_choices(
+    response_data: Any,
+    orchestrator: LLMOrchestrator,
+    user_msg: str,
+    llm_response: str,
+) -> None:
+    """用 QuestionChoices 结构化提取问答选项并写入 response_data（meta）"""
+    choices = await _extract_choices(orchestrator, user_msg, llm_response)
+    if choices:
+        response_data.options = choices
+
+
 def _is_reupload_photo_intent(message: str) -> bool:
     """检测用户是否要求重新上传舌面照/照片（与病历重传区分：需含 舌/面/照片）"""
     if not message:
@@ -248,7 +288,11 @@ def _apply_extracted_basic_fields(collected: dict, result: Any, user_msg: str) -
         collected["name"] = result.name
         changed = True
     if result.gender:
-        collected["gender"] = result.gender
+        # 性别统一为中文（male/female/m → 男/女），用户在前端看到的是中文
+        g = str(result.gender).strip().lower()
+        collected["gender"] = {"male": "男", "female": "女", "m": "男", "f": "女"}.get(
+            g, result.gender
+        )
         changed = True
     if result.age:
         collected["age"] = result.age
@@ -282,9 +326,25 @@ def _apply_extracted_basic_fields(collected: dict, result: Any, user_msg: str) -
 CHIEF_COMPLAINT_DIMENSION = "chief_complaint"
 # 付费后系统问诊维度（固定顺序）
 SYSTEMIC_DIMENSIONS = ["sleep", "diet", "stool", "urine", "emotion", "thermo"]
-# 付费后男科针对性追问轮数（系统问诊完成后，按辨证结果查表内症状追问 4-6 轮）
-MALE_INQUIRY_MIN_ROUNDS = 4
-MALE_INQUIRY_MAX_ROUNDS = 6
+# 付费后男科针对性追问轮数（系统问诊完成后，按辨证结果查表内症状追问 2-10 轮）
+# MIN 为强制保底轮数；达到 MIN 后每轮做「信息充分度」判定，足够即提前转辨证，MAX 兜底强制转
+MALE_INQUIRY_MIN_ROUNDS = 2
+MALE_INQUIRY_MAX_ROUNDS = 10
+
+# 辨证前的补充信息确认轮：男科追问完成后、正式辨证前，多问一轮「是否有其他补充」，
+# 用户回复后（无论有无补充）才进入正式辨证，避免遗漏手术史/用药/家族史等关键信息
+SUPPLEMENT_QUESTION = (
+    "您的问诊信息已收集完整。请问还有其他需要补充的信息吗？"
+    "比如既往手术史、长期用药、家族病史，或其他身体不适。"
+    "如果没有，请回复\"没有了\"，我将为您进行正式辨证并开具处方。"
+)
+SUPPLEMENT_OPTIONS = [
+    QuestionChoice(
+        title="补充信息",
+        type="single",
+        options=["没有了，开始辨证", "我还有其他要补充的"],
+    ),
+]
 
 
 def _systemic_done(progress: dict) -> bool:
@@ -293,15 +353,145 @@ def _systemic_done(progress: dict) -> bool:
 
 
 def _male_inquiry_done(state: dict[str, Any], progress: dict) -> bool:
-    """付费后男科针对性追问是否完成
+    """付费后男科针对性追问 + 补充信息确认轮是否完成（完成才可转辨证）
 
-    无辨证结果（如测试/异常直接进入 UPLOADING_IMAGES）→ 视为完成无需追问；
-    有辨证结果 → 追问达到 MIN 轮数才算完成。
+    无辨证结果（如测试/异常直接进入 UPLOADING_IMAGES）→ 补充确认轮完成即视为完成；
+    有辨证结果 → 追问达到 MIN 轮数且（充分度判定通过 或 已达 MAX 兜底），
+    且补充信息确认轮完成。
     """
     diagnosis = state.get("preliminary_diagnosis") or state.get("diagnosis") or {}
     if not diagnosis.get("disease"):
-        return True
-    return int(progress.get("male_inquiry", 0)) >= MALE_INQUIRY_MIN_ROUNDS
+        return bool(progress.get("supplement_done"))
+    rounds = int(progress.get("male_inquiry", 0))
+    if rounds < MALE_INQUIRY_MIN_ROUNDS:
+        return False
+    male_ok = (
+        rounds >= MALE_INQUIRY_MAX_ROUNDS
+        or bool(progress.get("male_inquiry_sufficient"))
+    )
+    return male_ok and bool(progress.get("supplement_done"))
+
+
+async def _judge_male_inquiry_sufficient(
+    orchestrator: LLMOrchestrator,
+    diagnosis: dict,
+    inquiry_data: dict,
+    state: dict[str, Any],
+) -> bool:
+    """达到最低轮次后，判断男科症状信息是否足以确认辨证/开方
+
+    注入辨证目标 + 查表症状清单 + 已确认症状 + 最近对话；结构化输出判定。
+    判定失败容错为"不足"（继续追问），由 MAX 兜底强制转辨证。
+    """
+    try:
+        checklist = tcm_matcher.format_symptom_checklist(
+            diagnosis.get("disease", ""), diagnosis.get("syndrome", "")
+        )
+        symptoms = inquiry_data.get("symptoms") or []
+        recent = state.get("messages", [])[-6:]
+        recent_text = "\n".join(
+            f"{'患者' if m.get('role') == 'user' else '医生'}: {m.get('content', '')}"
+            for m in recent
+        )
+        result = await orchestrator.ainvoke_structured(
+            MaleInquirySufficiency,
+            [
+                {"role": "system", "content": build_male_inquiry_sufficiency_prompt()},
+                {"role": "user", "content": (
+                    f"辨证目标：{diagnosis.get('disease', '')} / "
+                    f"{diagnosis.get('syndrome', '')}\n"
+                    f"相关症状清单：\n{checklist or '（无）'}\n\n"
+                    f"已确认症状：{symptoms or '暂无'}\n\n"
+                    f"最近对话：\n{recent_text or '暂无'}"
+                )},
+            ],
+        )
+        if result:
+            logger.info(
+                "男科追问充分度判定: sufficient=%s missing=%s",
+                result.sufficient, result.missing_areas,
+            )
+            return bool(result.sufficient)
+    except Exception as e:
+        logger.debug("男科追问充分度判定跳过: %s", e)
+    return False
+
+
+async def _extract_supplement_info(
+    orchestrator: LLMOrchestrator, request_message: str, inquiry_data: dict
+) -> dict:
+    """补充信息确认轮：把用户补充的信息纳入辨证依据
+
+    新症状进 inquiry.symptoms，回复原文存 inquiry.supplement（供辨证 RAG/提示词使用）。
+    失败容错：即使提取失败也把原文保留，不阻断转辨证。
+    """
+    msg = (request_message or "").strip()
+    if msg:
+        try:
+            sr = await orchestrator.ainvoke_structured(
+                SymptomExtraction,
+                [
+                    {"role": "system", "content": build_symptom_extraction_prompt()},
+                    {"role": "user", "content": msg},
+                    {"role": "user", "content": "用户补充的额外信息"},
+                ],
+            )
+            if sr and sr.symptoms:
+                existing = inquiry_data.get("symptoms") or []
+                fresh = [s for s in sr.symptoms if s not in existing]
+                if fresh:
+                    inquiry_data["symptoms"] = existing + fresh
+        except Exception as e:
+            logger.debug("补充信息提取跳过: %s", e)
+        inquiry_data["supplement"] = msg
+    return inquiry_data
+
+
+async def _run_supplement_round(
+    orchestrator: LLMOrchestrator,
+    request_message: str,
+    inquiry_data: dict,
+    progress: dict,
+    updates: dict[str, Any],
+) -> dict[str, Any]:
+    """辨证前的补充信息确认轮统一出口（男科追问完成或系统问诊兜底时调用）
+
+    三种状态：
+    1. supplement_done → 已确认过（测试/兼容）→ 直接转辨证；
+    2. supplement_pending → 本轮是用户对补充问题的回复 → 提取补充并完成，转辨证；
+    3. 均未设 → 发起补充确认轮（返回补充问题 + 选项，不转辨证）。
+    返回组装好的 updates。
+    """
+    if progress.get("supplement_done"):
+        updates["inquiry"] = inquiry_data
+        updates["inquiry_progress"] = progress
+        updates["state"] = SessionState.DIAGNOSIS.value
+        updates["response_text"] = (
+            "好的，问诊信息与舌面照已收集齐全，下面为您进行正式辨证。"
+        )
+        updates["response_action"] = ActionType.DIAGNOSIS
+        updates["response_data"] = ResponseData()
+        return updates
+
+    if progress.get("supplement_pending"):
+        inquiry_data = await _extract_supplement_info(
+            orchestrator, request_message, inquiry_data
+        )
+        progress["supplement_done"] = True
+        updates["inquiry"] = inquiry_data
+        updates["inquiry_progress"] = progress
+        updates["state"] = SessionState.DIAGNOSIS.value
+        updates["response_text"] = "好的，信息已收集完整，下面为您进行正式辨证。"
+        updates["response_action"] = ActionType.DIAGNOSIS
+        updates["response_data"] = ResponseData()
+        return updates
+
+    progress["supplement_pending"] = True
+    updates["inquiry_progress"] = progress
+    updates["response_text"] = SUPPLEMENT_QUESTION
+    updates["response_action"] = ActionType.CHAT
+    updates["response_data"] = ResponseData(options=SUPPLEMENT_OPTIONS)
+    return updates
 
 
 def _build_male_inquiry_prompt(diagnosis: dict, male_rounds: int) -> str:
@@ -318,7 +508,9 @@ def _build_male_inquiry_prompt(diagnosis: dict, male_rounds: int) -> str:
         "规则：\n"
         "1. 每次只问 1-2 项，聚焦男科症状（性功能、阴囊、尿路、会阴等）；\n"
         "2. 患者已确认/否认的项目不再重复询问；\n"
-        "3. 保持「中医分析反馈 → 自然引出下一问」的结构。"
+        "3. 保持「中医分析反馈 → 自然引出下一问」的结构；\n"
+        "4. **不要输出'请稍等''正在为您分析''请耐心等待'等让患者等待的话**，"
+        "直接提出下一个问题；全部问完也不要总结等待。"
     )
 
 
@@ -552,7 +744,7 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         )
         llm_response = await orchestrator.chat(messages)
 
-        # 2. 尝试结构化提取字段（独立 prompt）
+        # 2. 尝试结构化提取字段（独立 prompt；带助手回复，让 LLM 能判断是否给问答选项）
         changed = False
         try:
             extraction_prompt = build_basic_info_extraction_prompt()
@@ -561,6 +753,7 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 [
                     {"role": "system", "content": extraction_prompt},
                     {"role": "user", "content": state.get("request_message", "")},
+                    {"role": "user", "content": llm_response},
                 ],
             )
             if result:
@@ -569,6 +762,9 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 )
         except Exception as e:
             logger.debug("基础信息提取跳过: %s", e)
+        await _set_choices(
+            response_data, orchestrator, state.get("request_message", ""), llm_response
+        )
 
         # 3. LLM 明确询问了但用户未答 → 主动标"无"
         missing_allergy = "allergy_history" not in collected
@@ -654,9 +850,15 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             SessionState.INQUIRY,
         )
         transition_response = await orchestrator.chat(transition_messages)
+        response_data = ResponseData()
+        # 问候也常是主诉链路提问（如"晨勃是A、B还是C"）→ 结构化提取问答选项
+        await _set_choices(
+            response_data, orchestrator, state.get("request_message", ""), transition_response
+        )
         return {
             "response_text": transition_response,
             "response_action": ActionType.CHAT,
+            "response_data": response_data,
         }
 
     # ----------------------------------------------------------
@@ -759,6 +961,10 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         chain_done_now = bool(symptom_result and symptom_result.chief_complaint_done)
         if chain_done_now or any(kw in llm_response for kw in ["付费", "支付", "费用"]):
             response_data.need_pay = True
+        # 问答选项（QuestionChoices 结构化提取）
+        await _set_choices(
+            response_data, orchestrator, state.get("request_message", ""), llm_response
+        )
 
         updates["response_text"] = llm_response
         updates["response_action"] = ActionType.CHAT
@@ -1132,24 +1338,55 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             updates["inquiry_progress"] = progress
 
             # 全部维度覆盖 + 男科追问完成 + 照片已有 → 转诊断（响应交给 diagnosis 节点产出）
-            if _systemic_done(progress) and _male_inquiry_done(state, progress) and has_photos:
-                updates["state"] = SessionState.DIAGNOSIS.value
-            response_data = ResponseData()
-            # 未上传 或 用户明确要求重新上传舌面照 → 引导上传（need_upload_image=true）
-            if not has_photos or _is_reupload_photo_intent(state.get("request_message", "")):
-                response_data.need_upload_image = True
-            updates["response_text"] = llm_response
-            updates["response_action"] = ActionType.CHAT
-            updates["response_data"] = response_data
-            return updates
+            systemic_just_done = _systemic_done(progress)
+            # 系统问诊刚全部覆盖、男科追问未达标、已有辨证结果 → 本回合直接继续男科追问，
+            # 不让患者看到"请稍等/接下来为您分析"这类死局（非流式，患者等待无法触发下一步）
+            followup_needed = (
+                systemic_just_done
+                and not _male_inquiry_done(state, progress)
+                and bool((state.get("preliminary_diagnosis") or {}).get("disease"))
+                and int(progress.get("male_inquiry", 0)) < MALE_INQUIRY_MAX_ROUNDS
+                and has_photos
+            )
+            if not followup_needed:
+                if systemic_just_done and _male_inquiry_done(state, progress) and has_photos:
+                    updates["state"] = SessionState.DIAGNOSIS.value
+                response_data = ResponseData()
+                # 未上传 或 用户明确要求重新上传舌面照 → 引导上传（need_upload_image=true）
+                if not has_photos or _is_reupload_photo_intent(state.get("request_message", "")):
+                    response_data.need_upload_image = True
+                await _set_choices(
+                response_data, orchestrator, state.get("request_message", ""), llm_response
+            )
+                updates["response_text"] = llm_response
+                updates["response_action"] = ActionType.CHAT
+                updates["response_data"] = response_data
+                return updates
+            # followup_needed → 不返回，直接落入下方男科针对性追问（2.5），
+            # 该回合的系统问诊 llm_response 仅用于症状提取，不作为给患者的回复
+            logger.info(
+                "系统问诊全部覆盖，直接进入男科追问（男科第 %d 轮），不让患者等待",
+                int(progress.get("male_inquiry", 0)) + 1,
+            )
 
-        # 2.5 系统问诊已覆盖 → 男科针对性追问（按辨证结果查表内症状，4-6 轮）
+        # 2.5 系统问诊已覆盖 → 男科针对性追问（按辨证结果查表内症状，2-10 轮）
         diagnosis = state.get("preliminary_diagnosis") or {}
         male_rounds = int(progress.get("male_inquiry", 0))
         if diagnosis.get("disease") and male_rounds < MALE_INQUIRY_MAX_ROUNDS:
+            # 若刚从系统问诊落入（2.5 之前系统问诊更新了 inquiry）→ 基于更新后的数据，
+            # 否则取历史（系统问诊此前已完成）
+            inquiry_data = updates.get("inquiry") or dict(state.get("inquiry") or {})
+            # 补充信息确认轮（男科已达标并已发起）→ 提取用户补充并转辨证，不再问男科
+            if progress.get("supplement_pending") or progress.get("supplement_done"):
+                return await _run_supplement_round(
+                    orchestrator, state.get("request_message", ""),
+                    inquiry_data, progress, updates,
+                )
             # 若收敛辨证是照片上传时做的（早于系统问诊完成）→ 用完整系统问诊数据补收敛
             if _systemic_done(progress) and not progress.get("converged_with_inquiry"):
                 merged = dict(state)
+                merged["inquiry"] = inquiry_data
+                merged["inquiry_progress"] = progress
                 re_converged, _, _ = await perform_diagnosis(merged, orchestrator)
                 if re_converged.get("disease"):
                     diagnosis = re_converged
@@ -1165,7 +1402,6 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             )
             llm_response = await orchestrator.chat(messages)
             # 收集本轮确认的男科症状进 inquiry dict（供最终辨证）
-            inquiry_data = dict(state.get("inquiry") or {})
             symptom_result = None
             try:
                 symptom_result = await orchestrator.ainvoke_structured(
@@ -1185,21 +1421,48 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                     inquiry_data["symptoms"] = existing + fresh
             male_rounds += 1
             progress["male_inquiry"] = male_rounds
+            # 达到最低轮次后，判定已收集信息是否足以确认辨证/开方；
+            # 足够 → 标记完成并转辨证；不足 → 继续追问（MAX 兜底强制转）
+            if (
+                male_rounds >= MALE_INQUIRY_MIN_ROUNDS
+                and male_rounds < MALE_INQUIRY_MAX_ROUNDS
+                and not progress.get("male_inquiry_sufficient")
+            ):
+                if await _judge_male_inquiry_sufficient(
+                    orchestrator, diagnosis, inquiry_data, state
+                ):
+                    progress["male_inquiry_sufficient"] = True
+                    logger.info("男科追问信息充分，提前转辨证（男科第 %d 轮）", male_rounds)
             updates["inquiry"] = inquiry_data
             updates["inquiry_progress"] = progress
 
-            # 追问达到下限且照片已有 → 转诊断；否则继续追问
+            # 男科追问完成判定：达 MIN 且（充分度通过 或 达 MAX 兜底）且照片已有
+            male_done = (
+                male_rounds >= MALE_INQUIRY_MIN_ROUNDS
+                and has_photos
+                and (progress.get("male_inquiry_sufficient")
+                     or male_rounds >= MALE_INQUIRY_MAX_ROUNDS)
+            )
+            if male_done:
+                # 男科追问完成 → 进入补充信息确认轮（不立即转辨证）
+                logger.info("男科追问完成（第 %d 轮），进入补充信息确认轮", male_rounds)
+                return await _run_supplement_round(
+                    orchestrator, state.get("request_message", ""),
+                    inquiry_data, progress, updates,
+                )
+            # 男科追问未达标 → 继续追问
             response_data = ResponseData()
             if not has_photos or _is_reupload_photo_intent(state.get("request_message", "")):
                 response_data.need_upload_image = True
-            if male_rounds >= MALE_INQUIRY_MIN_ROUNDS and has_photos:
-                updates["state"] = SessionState.DIAGNOSIS.value
+            await _set_choices(
+            response_data, orchestrator, state.get("request_message", ""), llm_response
+        )
             updates["response_text"] = llm_response
             updates["response_action"] = ActionType.CHAT
             updates["response_data"] = response_data
             return updates
 
-        # 3. 系统问诊已全部覆盖
+        # 3. 系统问诊已全部覆盖（无男科追问目标 / 男科已达上限兜底）
         # 用户明确要求重新上传舌面照 → 引导重新上传（不转辨证）
         if _is_reupload_photo_intent(state.get("request_message", "")):
             return {
@@ -1216,11 +1479,12 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 "response_action": ActionType.CHAT,
                 "response_data": ResponseData(need_upload_image=True),
             }
-        updates["state"] = SessionState.DIAGNOSIS.value
-        updates["response_text"] = "好的，问诊信息与舌面照已收集齐全，下面为您进行正式辨证。"
-        updates["response_action"] = ActionType.DIAGNOSIS
-        updates["response_data"] = ResponseData()
-        return updates
+        # 进入补充信息确认轮（首次发起 / 进行中完成 / 已确认则转辨证）
+        inquiry_data = updates.get("inquiry") or dict(state.get("inquiry") or {})
+        return await _run_supplement_round(
+            orchestrator, state.get("request_message", ""),
+            inquiry_data, progress, updates,
+        )
 
     # ----------------------------------------------------------
     # DIAGNOSIS：辨证阶段
@@ -1303,16 +1567,21 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             )
             llm_response = await orchestrator.chat(messages)
 
+            response_data = ResponseData(
+                diagnosis_json={
+                    "disease": existing_diagnosis.get("disease", ""),
+                    "syndrome": existing_diagnosis.get("syndrome", ""),
+                },
+                diagnosis_done=True,
+            )
+            # 答疑轮若在提问且含备选（如"是继续调理还是复查"）→ 结构化提取问答选项
+            await _set_choices(
+            response_data, orchestrator, request_message, llm_response
+        )
             return {
                 "response_text": llm_response,
                 "response_action": ActionType.DIAGNOSIS,
-                "response_data": ResponseData(
-                    diagnosis_json={
-                        "disease": existing_diagnosis.get("disease", ""),
-                        "syndrome": existing_diagnosis.get("syndrome", ""),
-                    },
-                    diagnosis_done=True,
-                ),
+                "response_data": response_data,
             }
 
         # ═══════════════════════════════════════════════════════════
@@ -1497,9 +1766,14 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg or "请核对病历信息"},
             ])
+            response_data = ResponseData()
+            # 确认/修改是封闭选择 → 结构化提取问答选项
+            await _set_choices(
+            response_data, orchestrator, user_msg, llm_response
+        )
             updates["response_text"] = llm_response
             updates["response_action"] = ActionType.COLLECT_BASIC_INFO
-            updates["response_data"] = ResponseData()
+            updates["response_data"] = response_data
             return updates
 
         # ── 2. 用户明确表达重新上传病历（未带图）→ 引导上传 ──

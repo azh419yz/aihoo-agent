@@ -9,6 +9,8 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from app.models.chat_schema import QuestionChoice
+
 
 class PatientConfirmAction(str, Enum):
     """用户对就诊人确认的意图分类"""
@@ -21,7 +23,7 @@ class ExtractedPatientInfo(BaseModel):
     """从对话中提取的患者基本信息"""
 
     name: str | None = Field(default=None, description="姓名")
-    gender: str | None = Field(default=None, description="性别: male/female")
+    gender: str | None = Field(default=None, description="性别: 男/女")
     age: int | None = Field(default=None, description="年龄")
     height: str | None = Field(default=None, description="身高（如'175cm'）")
     occupation: str | None = Field(default=None, description="职业")
@@ -64,6 +66,36 @@ class SymptomExtraction(BaseModel):
 
     need_more_info: bool = Field(default=True, description="是否还需要更多信息")
     next_question: str = Field(default="", description="下一个应该问的问题方向")
+
+
+class QuestionChoices(BaseModel):
+    """助手回复中的问答选项（专用结构化输出，供前端渲染可点选 chips）
+
+    每条 choices = 一个独立的**封闭式选择题**（是/否、有/没有、A还是B、
+    是A、B还是C、上传/不上传等，或明确列出备选）；回复在一个自然段里问了
+    多个封闭式问题 → 每个问题一条，不要合并、不要遗漏。
+    开放/主观问题（性别、年龄、症状描述等无备选答案）→ choices=[]。
+    """
+
+    choices: list[QuestionChoice] = Field(
+        default_factory=list,
+        description=(
+            "问答选项块列表；每条含 title（项目/主题）、type（null/single/multi）、"
+            "options（选项文本，要完整覆盖回复中的全部备选、简短、用回复原文）"
+        ),
+    )
+
+
+class MaleInquirySufficiency(BaseModel):
+    """男科针对性追问的信息充分度判定（达到最低轮次后，每轮判断能否转辨证）"""
+
+    sufficient: bool = Field(
+        default=False,
+        description="当前已收集的男科症状信息是否足以确认辨证结果并据此开方",
+    )
+    missing_areas: list[str] = Field(
+        default_factory=list, description="仍缺失、需要继续追问确认的关键方面"
+    )
 
 
 class TongueAnalysisResult(BaseModel):

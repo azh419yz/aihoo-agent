@@ -99,6 +99,23 @@ class DiagnosisJson(BaseModel):
     syndrome: str = Field(default="", description="证型")
 
 
+class QuestionChoice(BaseModel):
+    """问答选项块：一个可选择项目（问题/主题）+ 类型 + 选项
+
+    助手一条回复可能包含多个封闭式问题，每个问题一条；开放/主观问题不产出。
+    """
+
+    title: str = Field(
+        default="",
+        description="项目/描述（问题或症状项的主题，如'排尿情况'、'阴囊局部'）",
+    )
+    type: str | None = Field(
+        default=None,
+        description="选项类型：null=无需选择 / single=单选 / multi=多选",
+    )
+    options: list[str] = Field(default_factory=list, description="选项文本列表（空=无选项）")
+
+
 class ResponseData(BaseModel):
     """响应业务数据"""
 
@@ -113,6 +130,14 @@ class ResponseData(BaseModel):
     need_pay: bool = Field(default=False, description="是否需要付费（引导付费时启用）")
     need_select: bool = Field(default=False, description="是否需要重新选择就诊人")
     diagnosis_done: bool = Field(default=False, description="辨证是否已完成（true 时表示可向 agent 请求开方）")
+    # ---- 问答选项（当轮瞬态，供前端渲染可点选 chips）----
+    options: list[QuestionChoice] = Field(
+        default_factory=list,
+        description=(
+            "问答选项块列表（每条=一个封闭式问题/项目，含 title/type/options；"
+            "空=无选项；用户可点选，也可直接文字输入）"
+        ),
+    )
 
 
 class ChatResponse(BaseModel):
