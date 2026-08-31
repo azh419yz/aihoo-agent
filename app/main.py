@@ -16,7 +16,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import register_routers
 from app.common.handlers import register_exception_handlers
 from app.core.config import settings
-from app.knowledge.prescription_index import prescription_index
 from app.knowledge.tcm_matcher import tcm_matcher
 from app.storage.mysql import mysql_client
 from app.storage.redis import redis_client
@@ -76,17 +75,6 @@ async def lifespan(application: FastAPI):
             )
         except Exception as e:
             logger.warning("⚠️ TCM 数据加载失败（服务将继续运行）: %s", e)
-
-    # 启动时加载处方索引（从 MySQL tcm_prescription 表）
-    if mysql_client.engine:
-        try:
-            await prescription_index.load(mysql_client.engine)
-            if prescription_index.loaded:
-                logger.info("✅ 处方索引加载成功（%d 条处方）", prescription_index.count)
-            else:
-                logger.info("ℹ️ 处方索引未加载（表 tcm_prescription 为空或不存在）")
-        except Exception as e:
-            logger.warning("⚠️ 处方索引加载失败（服务将继续运行）: %s", e)
 
     yield
 

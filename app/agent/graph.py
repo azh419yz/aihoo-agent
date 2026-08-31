@@ -346,6 +346,16 @@ SUPPLEMENT_OPTIONS = [
     ),
 ]
 
+# 病历基础信息确认轮：展示提取结果后给患者一个「确认」点选选项
+# （确认/修改是封闭选择；修改需带具体信息，让患者直接文字说明，故仅预设"确认"）
+MED_RECORD_CONFIRM_OPTIONS = [
+    QuestionChoice(
+        title="信息核对",
+        type="single",
+        options=["确认"],
+    ),
+]
+
 
 def _systemic_done(progress: dict) -> bool:
     """付费后系统问诊是否全部维度已覆盖"""
@@ -1767,10 +1777,8 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 {"role": "user", "content": user_msg or "请核对病历信息"},
             ])
             response_data = ResponseData()
-            # 确认/修改是封闭选择 → 结构化提取问答选项
-            await _set_choices(
-            response_data, orchestrator, user_msg, llm_response
-        )
+            # 确认/修改是封闭选择 → 直接给「确认」选项（不依赖 LLM 抽取）
+            response_data.options = MED_RECORD_CONFIRM_OPTIONS
             updates["response_text"] = llm_response
             updates["response_action"] = ActionType.COLLECT_BASIC_INFO
             updates["response_data"] = response_data
