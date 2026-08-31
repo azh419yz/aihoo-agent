@@ -180,6 +180,18 @@ def has_enough_patient_info(patient_info: dict) -> bool:
 _REUPLOAD_RECORD_KEYWORDS = ("重新上传", "重新传", "重传", "传错", "重新发", "换一个")
 
 
+_PHOTO_REUPLOAD_KEYWORDS = ("重新上传", "重新传", "重传", "重新发")
+
+
+def _is_reupload_photo_intent(message: str) -> bool:
+    """检测用户是否要求重新上传舌面照/照片（与病历重传区分：需含 舌/面/照片）"""
+    if not message:
+        return False
+    if not any(k in message for k in _PHOTO_REUPLOAD_KEYWORDS):
+        return False
+    return any(k in message for k in ("舌", "面", "照片", "舌面", "舌照", "面照", "图片"))
+
+
 def _is_reupload_record_intent(message: str) -> bool:
     """检测用户是否表达重新上传病历的意图
 
@@ -270,11 +282,44 @@ def _apply_extracted_basic_fields(collected: dict, result: Any, user_msg: str) -
 CHIEF_COMPLAINT_DIMENSION = "chief_complaint"
 # 付费后系统问诊维度（固定顺序）
 SYSTEMIC_DIMENSIONS = ["sleep", "diet", "stool", "urine", "emotion", "thermo"]
+# 付费后男科针对性追问轮数（系统问诊完成后，按辨证结果查表内症状追问 4-6 轮）
+MALE_INQUIRY_MIN_ROUNDS = 4
+MALE_INQUIRY_MAX_ROUNDS = 6
 
 
 def _systemic_done(progress: dict) -> bool:
     """付费后系统问诊是否全部维度已覆盖"""
     return all(progress.get(d) for d in SYSTEMIC_DIMENSIONS)
+
+
+def _male_inquiry_done(state: dict[str, Any], progress: dict) -> bool:
+    """付费后男科针对性追问是否完成
+
+    无辨证结果（如测试/异常直接进入 UPLOADING_IMAGES）→ 视为完成无需追问；
+    有辨证结果 → 追问达到 MIN 轮数才算完成。
+    """
+    diagnosis = state.get("preliminary_diagnosis") or state.get("diagnosis") or {}
+    if not diagnosis.get("disease"):
+        return True
+    return int(progress.get("male_inquiry", 0)) >= MALE_INQUIRY_MIN_ROUNDS
+
+
+def _build_male_inquiry_prompt(diagnosis: dict, male_rounds: int) -> str:
+    """构建男科针对性追问提示词（按辨证结果查表内症状清单）"""
+    disease = diagnosis.get("disease", "")
+    syndrome = diagnosis.get("syndrome", "")
+    checklist = tcm_matcher.format_symptom_checklist(disease, syndrome) or (
+        "-（表内暂无明细，按男科常见表现询问）"
+    )
+    return (
+        "你是一位中医男科专家。系统问诊已完成，下面针对您的男科主诉做进一步确认。\n"
+        f"您的辨证结果为：{disease} / {syndrome}\n"
+        f"与该辨证相关的症状清单（请逐项向患者确认是否出现及具体表现）：\n{checklist}\n\n"
+        "规则：\n"
+        "1. 每次只问 1-2 项，聚焦男科症状（性功能、阴囊、尿路、会阴等）；\n"
+        "2. 患者已确认/否认的项目不再重复询问；\n"
+        "3. 保持「中医分析反馈 → 自然引出下一问」的结构。"
+    )
 
 
 def _build_diagnosis_query(state: dict[str, Any], chief_complaint: str = "") -> str:
@@ -456,12 +501,16 @@ def route_after_inquiry(state: dict[str, Any]) -> str:
 
 
 def route_after_uploading(state: dict[str, Any]) -> str:
-    """uploading_images 后：舌面照已有且系统问诊全部覆盖 → 辨证；否则 END"""
+    """uploading_images 后：舌面照已有 + 系统问诊覆盖 + 男科追问完成 → 辨证；否则 END"""
     has_photos = bool(
         state.get("request_tongue_urls") or state.get("request_face_urls")
         or state.get("tongue_analysis") or state.get("face_analysis")
     )
-    if has_photos and _systemic_done(state.get("inquiry_progress") or {}):
+    progress = state.get("inquiry_progress") or {}
+    if has_photos and _systemic_done(progress) and _male_inquiry_done(state, progress):
+        # 用户要求重新上传舌面照 → 不转辨证，等重新上传
+        if _is_reupload_photo_intent(state.get("request_message", "")):
+            return END
         return "diagnosis"
     return END
 
@@ -989,6 +1038,20 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             updates["image_urls"] = tongue_urls + face_urls
             updates["tongue_analysis"] = tongue_result
             updates["face_analysis"] = face_result
+            # 舌面照分析出结论后 → 做一次辨病辨证（收敛），供后续男科针对性追问；
+            # 重传舌面照同样走这里 → 重新分析 + 重新辨证
+            merged = dict(state)
+            merged["tongue_analysis"] = tongue_result
+            merged["face_analysis"] = face_result
+            converged, _, _ = await perform_diagnosis(merged, orchestrator)
+            if converged.get("disease"):
+                updates["preliminary_diagnosis"] = converged
+                progress["converged_with_inquiry"] = _systemic_done(progress)
+                updates["inquiry_progress"] = progress
+                logger.info(
+                    "舌面照分析后收敛辨证: %s / %s",
+                    converged.get("disease"), converged.get("syndrome"),
+                )
 
         # 2. 系统问诊推进（未全部覆盖）
         if not _systemic_done(progress):
@@ -1001,8 +1064,15 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             covered = [d for d in SYSTEMIC_DIMENSIONS if progress.get(d)]
             pending = [d for d in SYSTEMIC_DIMENSIONS if not progress.get(d)]
             asked_dim = pending[0] if pending else None
+            # 舌面照状态：已上传/分析则不再催促上传（除非用户明确要求重新上传）
+            photos_ok = bool(
+                tongue_urls or face_urls
+                or state.get("tongue_analysis") or state.get("face_analysis")
+            )
+            photos_status = "已上传（请**不要再**催促上传舌面照）" if photos_ok else "未上传"
             system_prompt += (
                 "\n\n## 问诊进度\n"
+                f"- 舌面照：{photos_status}\n"
                 f"- 已覆盖维度：{covered or '无'}\n"
                 f"- 待问维度：{pending}\n"
                 f"- 本轮**必须**按顺序询问待问维度中的第一个（{asked_dim}），"
@@ -1042,6 +1112,9 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                     and not progress.get(d)
                 ]
                 progress.update({d: True for d in newly})
+                # 兜底：本轮应问维度用户已回答 → 确定性标记（防 LLM 漏报导致卡住）
+                if asked_dim:
+                    progress[asked_dim] = True
                 if symptom_result.dimension_findings:
                     for dim, txt in symptom_result.dimension_findings.items():
                         if txt and dim in newly:
@@ -1058,18 +1131,82 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             updates["inquiry"] = inquiry_data
             updates["inquiry_progress"] = progress
 
-            # 全部维度覆盖且照片已有 → 转诊断（响应交给 diagnosis 节点产出）
-            if _systemic_done(progress) and has_photos:
+            # 全部维度覆盖 + 男科追问完成 + 照片已有 → 转诊断（响应交给 diagnosis 节点产出）
+            if _systemic_done(progress) and _male_inquiry_done(state, progress) and has_photos:
                 updates["state"] = SessionState.DIAGNOSIS.value
             response_data = ResponseData()
-            if not has_photos:
+            # 未上传 或 用户明确要求重新上传舌面照 → 引导上传（need_upload_image=true）
+            if not has_photos or _is_reupload_photo_intent(state.get("request_message", "")):
                 response_data.need_upload_image = True
             updates["response_text"] = llm_response
             updates["response_action"] = ActionType.CHAT
             updates["response_data"] = response_data
             return updates
 
+        # 2.5 系统问诊已覆盖 → 男科针对性追问（按辨证结果查表内症状，4-6 轮）
+        diagnosis = state.get("preliminary_diagnosis") or {}
+        male_rounds = int(progress.get("male_inquiry", 0))
+        if diagnosis.get("disease") and male_rounds < MALE_INQUIRY_MAX_ROUNDS:
+            # 若收敛辨证是照片上传时做的（早于系统问诊完成）→ 用完整系统问诊数据补收敛
+            if _systemic_done(progress) and not progress.get("converged_with_inquiry"):
+                merged = dict(state)
+                re_converged, _, _ = await perform_diagnosis(merged, orchestrator)
+                if re_converged.get("disease"):
+                    diagnosis = re_converged
+                    updates["preliminary_diagnosis"] = re_converged
+                progress["converged_with_inquiry"] = True
+                updates["inquiry_progress"] = progress
+                logger.info("男科追问前补收敛辨证: %s / %s",
+                            diagnosis.get("disease"), diagnosis.get("syndrome"))
+            male_prompt = _build_male_inquiry_prompt(diagnosis, male_rounds)
+            messages = await build_chat_messages(
+                male_prompt, state, state.get("request_message", ""),
+                SessionState.UPLOADING_IMAGES,
+            )
+            llm_response = await orchestrator.chat(messages)
+            # 收集本轮确认的男科症状进 inquiry dict（供最终辨证）
+            inquiry_data = dict(state.get("inquiry") or {})
+            symptom_result = None
+            try:
+                symptom_result = await orchestrator.ainvoke_structured(
+                    SymptomExtraction,
+                    [
+                        {"role": "system", "content": build_symptom_extraction_prompt()},
+                        {"role": "user", "content": state.get("request_message", "")},
+                        {"role": "user", "content": llm_response},
+                    ],
+                )
+            except Exception as e:
+                logger.warning("男科追问症状提取失败: %s", e)
+            if symptom_result and symptom_result.symptoms:
+                existing = inquiry_data.get("symptoms") or []
+                fresh = [s for s in symptom_result.symptoms if s not in existing]
+                if fresh:
+                    inquiry_data["symptoms"] = existing + fresh
+            male_rounds += 1
+            progress["male_inquiry"] = male_rounds
+            updates["inquiry"] = inquiry_data
+            updates["inquiry_progress"] = progress
+
+            # 追问达到下限且照片已有 → 转诊断；否则继续追问
+            response_data = ResponseData()
+            if not has_photos or _is_reupload_photo_intent(state.get("request_message", "")):
+                response_data.need_upload_image = True
+            if male_rounds >= MALE_INQUIRY_MIN_ROUNDS and has_photos:
+                updates["state"] = SessionState.DIAGNOSIS.value
+            updates["response_text"] = llm_response
+            updates["response_action"] = ActionType.CHAT
+            updates["response_data"] = response_data
+            return updates
+
         # 3. 系统问诊已全部覆盖
+        # 用户明确要求重新上传舌面照 → 引导重新上传（不转辨证）
+        if _is_reupload_photo_intent(state.get("request_message", "")):
+            return {
+                "response_text": "好的，您可以重新上传舌面照，我来重新为您分析。",
+                "response_action": ActionType.CHAT,
+                "response_data": ResponseData(need_upload_image=True),
+            }
         if not has_photos:
             return {
                 "response_text": (

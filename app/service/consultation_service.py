@@ -111,7 +111,7 @@ class ConsultationService:
         # 7. 返回响应
         return ChatResponse(
             session_id=session_id,
-            response=final["response_text"],
+            message=final["response_text"],
             action=final["response_action"].value,
             meta=final["response_data"],
         )

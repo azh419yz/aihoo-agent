@@ -565,6 +565,35 @@ class TcmMatcher:
 
         return "\n".join(parts)
 
+    def format_symptom_checklist(self, disease: str, syndrome: str) -> str:
+        """按辨证结果从表里取 疾病/证型 的完整症状明细（供付费后男科针对性追问）
+
+        含 disease 表的 描述/常见症状/主要特征，syndrome 表的 主要症状/次要症状。
+        """
+        parts = []
+        if disease:
+            for d in self._diseases:
+                if d.get("disease_name") != disease:
+                    continue
+                if d.get("disease_description"):
+                    parts.append(f"- {disease}描述：{d['disease_description']}")
+                if d.get("common_symptoms"):
+                    parts.append(f"- {disease}常见症状：{d['common_symptoms']}")
+                if d.get("main_features"):
+                    parts.append(f"- {disease}主要特征：{d['main_features']}")
+                break
+        if syndrome:
+            for name in [s.strip() for s in syndrome.split(',') if s.strip()]:
+                for sy in self._syndromes:
+                    if sy.get("syndrome_name") != name:
+                        continue
+                    if sy.get("main_symptoms"):
+                        parts.append(f"- {name}主要症状：{sy['main_symptoms']}")
+                    if sy.get("secondary_symptoms"):
+                        parts.append(f"- {name}次要症状：{sy['secondary_symptoms']}")
+                    break
+        return "\n".join(parts)
+
     def format_full_taxonomy(self) -> str:
         """输出全部标准病名/证型及症状描述（供 LLM 全列表选择）
 

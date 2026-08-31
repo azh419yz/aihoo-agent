@@ -119,6 +119,6 @@ class ChatResponse(BaseModel):
     """对话响应"""
 
     session_id: str = Field(..., description="问诊会话唯一标识")
-    response: str = Field(..., description="Agent 回复内容")
+    message: str = Field(..., description="Agent 回复内容")
     action: str = Field(..., description="业务动作标识")
     meta: ResponseData | None = Field(default=None, description="业务数据（附加业务上下文）")
