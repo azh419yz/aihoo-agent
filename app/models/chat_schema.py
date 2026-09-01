@@ -113,7 +113,10 @@ class QuestionChoice(BaseModel):
         default=None,
         description="选项类型：null=无需选择 / single=单选 / multi=多选",
     )
-    options: list[str] = Field(default_factory=list, description="选项文本列表（空=无选项）")
+    options: list[str] = Field(
+        default_factory=list,
+        description="选项文本列表（空=无选项；总数≤4、以3为佳）",
+    )
 
 
 class ResponseData(BaseModel):

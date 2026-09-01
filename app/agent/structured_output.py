@@ -81,7 +81,8 @@ class QuestionChoices(BaseModel):
         default_factory=list,
         description=(
             "问答选项块列表；每条含 title（项目/主题）、type（null/single/multi）、"
-            "options（选项文本，要完整覆盖回复中的全部备选、简短、用回复原文）"
+            "options（选项文本，要完整覆盖回复中的全部备选、简短、用回复原文、"
+            "总数不超过 4 个以 3 个为佳；同一回复要么全部选项化、要么全部为空）"
         ),
     )
 

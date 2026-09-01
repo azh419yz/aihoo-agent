@@ -928,12 +928,11 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
 
         updates: dict[str, Any] = {}
 
-        # 更新主诉
-        if symptom_result and symptom_result.key_findings:
-            if chief_complaint and chief_complaint not in symptom_result.key_findings:
-                chief_complaint = chief_complaint + "；" + symptom_result.key_findings
-            else:
-                chief_complaint = symptom_result.key_findings
+        # 更新主诉：只在为空时写入，保留「用户主动陈述的原始主诉」。
+        # 追问确认的 key_findings 不再并入主诉——追问内容归 inquiry 单独保存，
+        # 辨证/开方时再分开描述（见 build_diagnosis_prompt / build_prescription_prompt）。
+        if symptom_result and symptom_result.key_findings and not chief_complaint:
+            chief_complaint = symptom_result.key_findings
             updates["chief_complaint"] = chief_complaint
 
         # 更新问诊信息
@@ -1693,6 +1692,7 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 patient_info=patient_info,
                 knowledge_context=knowledge_context,
                 base_formula=base_formula,
+                inquiry_info=state.get("inquiry", {}),
                 orchestrator=orchestrator,
             )
 

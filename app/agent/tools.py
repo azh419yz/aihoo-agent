@@ -76,6 +76,7 @@ async def generate_prescription(
         patient_info: dict[str, Any] | None = None,
         knowledge_context: str | None = None,
         base_formula: str | None = None,
+        inquiry_info: dict[str, Any] | None = None,
         orchestrator: LLMOrchestrator | None = None,
 ) -> dict[str, Any]:
     """根据辨证结果生成处方
@@ -103,6 +104,7 @@ async def generate_prescription(
         patient_info=patient_info,
         knowledge_context=knowledge_context,
         base_formula=base_formula,
+        inquiry_info=inquiry_info,
     )
 
     result = await orchestrator.ainvoke_structured(
