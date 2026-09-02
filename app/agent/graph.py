@@ -29,6 +29,7 @@ from app.agent.prompts import (
     build_diagnosis_prompt,
     build_existing_diagnosis_display_prompt,
     build_male_inquiry_sufficiency_prompt,
+    build_supplement_extraction_prompt,
     build_symptom_extraction_prompt,
     build_system_prompt,
 )
@@ -38,6 +39,7 @@ from app.agent.structured_output import (
     ExtractedPatientInfo,
     MaleInquirySufficiency,
     QuestionChoices,
+    SupplementExtraction,
     SymptomExtraction,
 )
 from app.agent.tools import generate_prescription, retrieve_knowledge
@@ -334,17 +336,11 @@ MALE_INQUIRY_MAX_ROUNDS = 10
 # 辨证前的补充信息确认轮：男科追问完成后、正式辨证前，多问一轮「是否有其他补充」，
 # 用户回复后（无论有无补充）才进入正式辨证，避免遗漏手术史/用药/家族史等关键信息
 SUPPLEMENT_QUESTION = (
-    "您的问诊信息已收集完整。请问还有其他需要补充的信息吗？"
-    "比如既往手术史、长期用药、家族病史，或其他身体不适。"
-    "如果没有，请回复\"没有了\"，我将为您进行正式辨证并开具处方。"
+    "您的问诊信息已收集完整。在正式辨证前，请确认是否还有其他需要补充的信息？"
+    "（如既往手术史、长期用药、家族病史，或其他身体不适）"
+    "如有补充，请直接输入补充内容；如没有，请回复\"没有了\"，"
+    "我将为您进行正式辨证并开具处方。"
 )
-SUPPLEMENT_OPTIONS = [
-    QuestionChoice(
-        title="补充信息",
-        type="single",
-        options=["没有了，开始辨证", "我还有其他要补充的"],
-    ),
-]
 
 # 病历基础信息确认轮：展示提取结果后给患者一个「确认」点选选项
 # （确认/修改是封闭选择；修改需带具体信息，让患者直接文字说明，故仅预设"确认"）
@@ -432,28 +428,31 @@ async def _extract_supplement_info(
 ) -> dict:
     """补充信息确认轮：把用户补充的信息纳入辨证依据
 
-    新症状进 inquiry.symptoms，回复原文存 inquiry.supplement（供辨证 RAG/提示词使用）。
-    失败容错：即使提取失败也把原文保留，不阻断转辨证。
+    用 LLM 判断用户是否真的补充了新信息（SupplementExtraction）：
+    - has_supplement=true → 新症状进 inquiry.symptoms，回复原文存 inquiry.supplement；
+    - has_supplement=false（用户表示"没有了"等）→ 不写入 supplement，避免污染主诉。
+    失败容错：提取失败无法判断时保守保留原文，不阻断转辨证。
     """
     msg = (request_message or "").strip()
     if msg:
         try:
             sr = await orchestrator.ainvoke_structured(
-                SymptomExtraction,
+                SupplementExtraction,
                 [
-                    {"role": "system", "content": build_symptom_extraction_prompt()},
+                    {"role": "system", "content": build_supplement_extraction_prompt()},
                     {"role": "user", "content": msg},
-                    {"role": "user", "content": "用户补充的额外信息"},
                 ],
             )
-            if sr and sr.symptoms:
-                existing = inquiry_data.get("symptoms") or []
-                fresh = [s for s in sr.symptoms if s not in existing]
-                if fresh:
-                    inquiry_data["symptoms"] = existing + fresh
         except Exception as e:
             logger.debug("补充信息提取跳过: %s", e)
-        inquiry_data["supplement"] = msg
+            sr = None
+        if sr is None or sr.has_supplement:
+            if sr and sr.new_symptoms:
+                existing = inquiry_data.get("symptoms") or []
+                fresh = [s for s in sr.new_symptoms if s not in existing]
+                if fresh:
+                    inquiry_data["symptoms"] = existing + fresh
+            inquiry_data["supplement"] = msg
     return inquiry_data
 
 
@@ -500,7 +499,8 @@ async def _run_supplement_round(
     updates["inquiry_progress"] = progress
     updates["response_text"] = SUPPLEMENT_QUESTION
     updates["response_action"] = ActionType.CHAT
-    updates["response_data"] = ResponseData(options=SUPPLEMENT_OPTIONS)
+    # 补充轮不给选项：有补充直接输入、无补充回复"没有了"（见 SUPPLEMENT_QUESTION 话术）
+    updates["response_data"] = ResponseData()
     return updates
 
 

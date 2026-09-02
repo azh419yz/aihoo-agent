@@ -68,6 +68,21 @@ class SymptomExtraction(BaseModel):
     next_question: str = Field(default="", description="下一个应该问的问题方向")
 
 
+class SupplementExtraction(BaseModel):
+    """补充信息意图判断（辨证前最后一步补充确认）
+
+    判断用户回复是否提供了真正需要补充的信息；没有补充（"没有了"等）时 has_supplement=false。
+    """
+
+    has_supplement: bool = Field(
+        default=False,
+        description="用户是否补充了新的信息（true=有补充；false=明确表示没有补充，如'没有了'）",
+    )
+    new_symptoms: list[str] = Field(
+        default_factory=list, description="补充信息中明确提及的新症状/异常点"
+    )
+
+
 class QuestionChoices(BaseModel):
     """助手回复中的问答选项（专用结构化输出，供前端渲染可点选 chips）
 
