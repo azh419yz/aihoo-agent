@@ -133,6 +133,10 @@ class ResponseData(BaseModel):
     need_pay: bool = Field(default=False, description="是否需要付费（引导付费时启用）")
     need_select: bool = Field(default=False, description="是否需要重新选择就诊人")
     diagnosis_done: bool = Field(default=False, description="辨证是否已完成（true 时表示可向 agent 请求开方）")
+    need_doctor_prescription: bool = Field(
+        default=False,
+        description="知识库无匹配案例、处方待医生填写（true 时前端转医生开具）",
+    )
     # ---- 问答选项（当轮瞬态，供前端渲染可点选 chips）----
     options: list[QuestionChoice] = Field(
         default_factory=list,

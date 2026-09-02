@@ -52,6 +52,7 @@ SESSION_FIELD_NAMES: list[str] = [
     "preliminary_diagnosis",
     "patient_select_pending",
     "inquiry_progress",
+    "prescription_reason",
 ]
 
 

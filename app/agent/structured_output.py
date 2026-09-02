@@ -178,3 +178,17 @@ class PrescriptionResult(BaseModel):
     syndrome: str = Field(default="", description="证型（多个用逗号分隔）")
     drugList: list[DrugItem] = Field(default_factory=list, description="药品列表")
     instruction: InstructionInfo = Field(default_factory=InstructionInfo, description="用法信息")
+
+
+class CaseSelectionResult(BaseModel):
+    """知识库选案结果：从候选历史案例中选出最匹配的一个
+
+    选中后处方由代码从该案例【处方】原样解析，LLM 不接触药方。
+    """
+
+    selected_index: int = Field(
+        default=0, description="选中案例序号（1-based，指向候选列表）"
+    )
+    analysis: str = Field(
+        default="", description="选择原因（辨病辨证一致性、主诉吻合、年龄/病史匹配等）"
+    )

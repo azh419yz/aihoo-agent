@@ -42,8 +42,8 @@ from app.agent.structured_output import (
     SupplementExtraction,
     SymptomExtraction,
 )
-from app.agent.tools import generate_prescription, retrieve_knowledge
-from app.knowledge.qianfan import format_retrieval_context, retrieve_with_filter
+from app.agent.tools import prescribe_from_kb, retrieve_knowledge
+from app.knowledge.qianfan import retrieve_with_filter
 from app.knowledge.tcm_matcher import tcm_matcher
 from app.models.chat_schema import InquiryJson, QuestionChoice, ResponseData
 from app.multimodal.medical_record import analyze_medical_record, format_medical_record_basic_info
@@ -68,6 +68,7 @@ class ConsultationState(TypedDict, total=False):
     inquiry: dict
     diagnosis: dict
     prescription: dict
+    prescription_reason: dict  # 开方选案分析原因（写 Redis 审计，不展示给用户）
     image_urls: list
     tongue_analysis: list
     face_analysis: list
@@ -539,7 +540,7 @@ def _build_diagnosis_query(state: dict[str, Any], chief_complaint: str = "") -> 
 def _build_prescription_query(
     state: dict[str, Any], diagnosis: dict, chief_complaint: str = ""
 ) -> str:
-    """构建开方 RAG 检索 query：疾病/证型 + 主诉 + 追问内容"""
+    """构建开方 RAG 检索 query：疾病/证型 + 主诉 + 追问 + 既往病史/过敏史"""
     parts = []
     if diagnosis.get("disease"):
         parts.append(f"疾病：{diagnosis['disease']}")
@@ -554,6 +555,13 @@ def _build_prescription_query(
     )
     if dims:
         parts.append(f"追问：{dims}")
+    patient_info = state.get("patient_info") or {}
+    past = patient_info.get("past_medical_history")
+    allergy = patient_info.get("allergy_history")
+    if past:
+        parts.append(f"既往病史：{past}")
+    if allergy:
+        parts.append(f"过敏史：{allergy}")
     return "，".join(parts)
 
 
@@ -930,7 +938,7 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
 
         # 更新主诉：只在为空时写入，保留「用户主动陈述的原始主诉」。
         # 追问确认的 key_findings 不再并入主诉——追问内容归 inquiry 单独保存，
-        # 辨证/开方时再分开描述（见 build_diagnosis_prompt / build_prescription_prompt）。
+        # 辨证/开方时再分开描述（见 build_diagnosis_prompt 的「主诉/追问采集信息」两段）。
         if symptom_result and symptom_result.key_findings and not chief_complaint:
             chief_complaint = symptom_result.key_findings
             updates["chief_complaint"] = chief_complaint
@@ -1613,8 +1621,6 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         patient_info = state.get("patient_info") or {}
         chief_complaint = state.get("chief_complaint") or ""
         request_message = state.get("request_message", "")
-        patient_gender = patient_info.get("gender") if patient_info else None
-        patient_age = patient_info.get("age") if patient_info else None
 
         # 重新上传舌面照 → 重新分析 + 重新辨证（覆盖旧结果），再按新辨证重新开方
         reupload_tongue = state.get("request_tongue_urls") or []
@@ -1641,73 +1647,70 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
 
         # 检查是否已有处方（防止 DIAGNOSIS 自动调用后重复生成；重传时强制重新开方）
         existing = state.get("prescription")
+        reason = None
         if existing and existing.get("drugList") and not reuploaded:
             prescription = existing
         else:
-            # RAG 检索 expert 知识库相似病例（query=疾病/证型/主诉/追问，
-            # 检索后按 性别精确 + 年龄±10 过滤）
+            # 检索 expert 库（性别+年龄±10 过滤）→ 选案并「原封不动」采用处方
             rag_query = _build_prescription_query(state, diagnosis, chief_complaint)
-            knowledge_context = format_retrieval_context(
-                await retrieve_with_filter(
-                    rag_query,
-                    gender=patient_gender,
-                    age=patient_age,
-                    age_range=10,
-                    top_k=3,
-                    fetch_k=30,
-                )
+            results = await retrieve_with_filter(
+                rag_query,
+                gender=(patient_info or {}).get("gender"),
+                age=(patient_info or {}).get("age"),
+                age_range=10,
+                top_k=5,
+                fetch_k=30,
+                syndromes=[s for s in (diagnosis.get("syndrome") or "").split(",") if s] or None,
             )
-
-            # 获取推荐主方（从 tcm_syndrome.recommended_formula）
-            syndrome_name = diagnosis.get("syndrome", "")
-            disease_name = diagnosis.get("disease", "")
-            base_formula = tcm_matcher.get_recommended_formula(syndrome_name)
-
-            # 证型为空或查不到推荐主方 → 降级：用主诉/症状重新匹配候选证型（防断链）
-            if not base_formula:
-                fallback_syndromes = tcm_matcher.match_syndromes(
-                    chief_complaint or request_message, top_k=1
-                )
-                if fallback_syndromes:
-                    fallback = fallback_syndromes[0]["name"]
-                    logger.info(
-                        "证型 %r 无推荐主方，降级匹配到候选证型 %s", syndrome_name, fallback
-                    )
-                    base_formula = tcm_matcher.get_recommended_formula(fallback)
-                    if not syndrome_name:
-                        # 辨证结果缺失证型时，用降级证型回填（影响后续 prompt 与响应）
-                        diagnosis = {**diagnosis, "syndrome": fallback}
-                        syndrome_name = fallback
-
-            # 调试日志
-            logger.info(
-                "处方生成参考: disease=%s syndrome=%s base_formula=%s rag_query=%s",
-                disease_name, syndrome_name, base_formula or "(无)", rag_query[:80],
-            )
-
-            # 生成处方（expert 库历史案例已含在 knowledge_context）
-            prescription = await generate_prescription(
+            prescription, reason = await prescribe_from_kb(
                 diagnosis=diagnosis,
-                chief_complaint=chief_complaint or request_message,
+                results=results,
                 patient_info=patient_info,
-                knowledge_context=knowledge_context,
-                base_formula=base_formula,
+                chief_complaint=chief_complaint or request_message,
                 inquiry_info=state.get("inquiry", {}),
                 orchestrator=orchestrator,
             )
+            logger.info(
+                "处方来源: matched=%s query=%s",
+                bool(reason and reason.get("matched")), rag_query[:80],
+            )
 
-        # 构建回复
-        drugs_text = "\n".join(
-            f"- {d.get('name', '')} {d.get('number', '')}g"
-            for d in prescription.get("drugList", [])
-        )
+        # 构建回复（有处方 → 药物列表；无匹配 → 提示交医生填写）
+        drugs = prescription.get("drugList", [])
         inst = prescription.get("instruction", {})
-        response = f"【处方已开具】\n\n{drugs_text}"
-        if inst.get("advice"):
-            response += f"\n\n医嘱：{inst['advice']}"
-        if inst.get("remark"):
-            response += f"\n\n备注：{inst['remark']}"
-        response += "\n\n请遵医嘱服用，如有不适请及时复诊。"
+        need_doctor = False
+        if drugs:
+            drugs_text = "\n".join(
+                f"- {d.get('name', '')} {d.get('number', '')}g" for d in drugs
+            )
+            response = f"【处方已开具】\n\n{drugs_text}"
+            if inst.get("advice"):
+                response += f"\n\n医嘱：{inst['advice']}"
+            if inst.get("remark"):
+                response += f"\n\n备注：{inst['remark']}"
+            response += "\n\n请遵医嘱服用，如有不适请及时复诊。"
+        else:
+            need_doctor = True
+            response = (
+                f"已为您完成辨证（辨病：{diagnosis.get('disease', '')}，"
+                f"证型：{diagnosis.get('syndrome', '')}）。"
+                "知识库暂无完全匹配的既往案例，处方将由医生确认后为您填写开具。"
+            )
+
+        response_data = ResponseData(
+            diagnosis_json={
+                "disease": diagnosis.get("disease", ""),
+                "syndrome": diagnosis.get("syndrome", ""),
+            },
+            prescription_json={
+                "disease": prescription.get("disease", ""),
+                "syndrome": prescription.get("syndrome", ""),
+                "drugList": drugs,
+                "instruction": inst,
+            },
+        )
+        if need_doctor:
+            response_data.need_doctor_prescription = True
 
         updates = {
             # 图内从 DIAGNOSIS + PRESCRIBE 直接进入时，需把状态推进到 PRESCRIBING
@@ -1715,19 +1718,11 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             "prescription": prescription,
             "response_text": response,
             "response_action": ActionType.PRESCRIBE,
-            "response_data": ResponseData(
-                diagnosis_json={
-                    "disease": diagnosis.get("disease", ""),
-                    "syndrome": diagnosis.get("syndrome", ""),
-                },
-                prescription_json={
-                    "disease": prescription.get("disease", ""),
-                    "syndrome": prescription.get("syndrome", ""),
-                    "drugList": prescription.get("drugList", []),
-                    "instruction": inst,
-                },
-            ),
+            "response_data": response_data,
         }
+        if reason is not None:
+            # 选案分析原因写入 Redis（白名单持久化，不展示给用户）
+            updates["prescription_reason"] = reason
         # 重传舌面照：写回新分析结果与辨证结果
         if reuploaded:
             updates.update({

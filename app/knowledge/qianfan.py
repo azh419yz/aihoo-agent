@@ -217,6 +217,38 @@ def _parse_case_age_gender(text: str) -> tuple[str | None, int | None]:
     return None, None
 
 
+def parse_case_prescription(text: str) -> tuple[list[dict], str] | None:
+    """从 expert 案例文本解析【处方】（用于「原封不动」采用历史案例处方）
+
+    兼容两种格式：
+      '【处方】(14剂) 千年健30g、川牛膝40g' → (drugList, "14")
+      '【处方】千年健30g、川牛膝40g'        → (drugList, "")
+    药味按「、」等分隔，剂量支持小数；某味药格式异常 → 整体返回 None。
+    Returns: (drugList, doseNumber)；无法解析返回 None
+    """
+    if not text:
+        return None
+    m = re.search(r'【处方】\s*(?:\((\d+)剂?\))?\s*([^【]+)', text)
+    if not m:
+        return None
+    dose_number = m.group(1) or ""
+    body = (m.group(2) or "").strip()
+    if not body:
+        return None
+    drug_list: list[dict] = []
+    for item in re.split(r'[、,，;；\s]+', body):
+        item = item.strip()
+        if not item:
+            continue
+        dm = re.match(r'^(.+?)(\d+(?:\.\d+)?)\s*(?:g|克)?\s*(?:\(.*\))?$', item)
+        if not dm or not dm.group(1).strip():
+            return None
+        drug_list.append({"name": dm.group(1).strip(), "number": dm.group(2)})
+    if not drug_list:
+        return None
+    return drug_list, dose_number
+
+
 async def retrieve_with_filter(
     query: str,
     gender: str | None = None,

@@ -26,6 +26,9 @@ class ConsultationSession(BaseModel):
     inquiry_json: dict[str, Any] | None = Field(default=None, description="问诊信息")
     diagnosis_json: dict[str, Any] | None = Field(default=None, description="辨病辨证结果")
     prescription_json: dict[str, Any] | None = Field(default=None, description="处方信息")
+    prescription_reason: dict[str, Any] | None = Field(
+        default=None, description="开方选案分析原因（Redis 审计用，不展示给用户）"
+    )
     image_urls: list[str] | None = Field(default=None, description="舌照/面照 URL 列表")
 
     patient_mismatch: bool = Field(default=False, description="患者信息是否不匹配")
