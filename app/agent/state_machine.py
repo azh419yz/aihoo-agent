@@ -63,15 +63,3 @@ STATE_KNOWLEDGE_BASE: dict[SessionState, str] = {
     SessionState.DIAGNOSIS: "both",
     SessionState.PRESCRIBING: "expert",
 }
-
-
-# 各状态下主诉是否持续收集
-STATE_CHIEF_COMPLAINT_ACTIVE: dict[SessionState, bool] = {
-    SessionState.COLLECTING_BASIC: False,
-    SessionState.INQUIRY: True,
-    SessionState.PRELIMINARY_DIAGNOSIS: False,
-    SessionState.SELECTING_PATIENT: False,
-    SessionState.UPLOADING_IMAGES: True,
-    SessionState.DIAGNOSIS: True,
-    SessionState.PRESCRIBING: False,
-}

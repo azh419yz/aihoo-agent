@@ -383,23 +383,6 @@ class TcmMatcher:
             self._syndromes = []
             self._loaded = False
 
-    def get_recommended_formula(self, syndrome_name: str) -> str | None:
-        """根据证型名称获取推荐方剂
-
-        Args:
-            syndrome_name: 证型名称（如"肾阳虚证"）
-
-        Returns:
-            推荐方剂名称（如"右归丸加减"），未找到返回 None
-        """
-        if not self._loaded or not syndrome_name:
-            return None
-        name = syndrome_name.strip()
-        for s in self._syndromes:
-            if s.get("syndrome_name", "").strip() == name:
-                return s.get("recommended_formula") or None
-        return None
-
     @property
     def loaded(self) -> bool:
         return self._loaded

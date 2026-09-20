@@ -34,14 +34,6 @@ class ExtractedPatientInfo(BaseModel):
     has_enough_info: bool = Field(default=False, description="信息是否足够进入下一阶段")
 
 
-class PatientMatchResult(BaseModel):
-    """患者信息匹配结果"""
-
-    is_match: bool = Field(..., description="是否匹配")
-    mismatches: list[str] = Field(default_factory=list, description="不匹配的字段列表")
-    reason: str = Field(default="", description="详细原因")
-
-
 class SymptomExtraction(BaseModel):
     """从问诊中提取的症状信息 + 问诊维度进度"""
 
@@ -135,13 +127,6 @@ class DiagnosisResult(BaseModel):
     formula_name: str | None = Field(default=None, description="推荐方剂名称")
 
 
-class DrugItem(BaseModel):
-    """处方中的药品"""
-
-    name: str = Field(..., description="药品名称")
-    number: str = Field(default="", description="数量（克数）")
-
-
 class InstructionInfo(BaseModel):
     """处方用法信息"""
 
@@ -169,15 +154,6 @@ class PatientConfirmResult(BaseModel):
         default="",
         description="意图分析理由，如'用户确认就诊人信息正确'/'用户要求重新选择'等",
     )
-
-
-class PrescriptionResult(BaseModel):
-    """处方生成结果"""
-
-    disease: str = Field(default="", description="疾病诊断（辨病结果）")
-    syndrome: str = Field(default="", description="证型（多个用逗号分隔）")
-    drugList: list[DrugItem] = Field(default_factory=list, description="药品列表")
-    instruction: InstructionInfo = Field(default_factory=InstructionInfo, description="用法信息")
 
 
 class CaseSelectionResult(BaseModel):

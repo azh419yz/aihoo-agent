@@ -18,8 +18,6 @@ from pydantic import BaseModel
 
 from app.agent.prompts import (
     build_patient_confirm_prompt,
-    build_patient_match_prompt,
-    build_patient_match_system_message,
 )
 from app.core.config import settings
 
@@ -30,7 +28,8 @@ class LLMOrchestrator:
     """轻量 LLM 编排器
 
     提供 chat() / chat_with_vl() / ainvoke_structured() 三个核心方法，
-    外加 match_patient_info() / confirm_patient_info() 两个业务封装。
+    外加 confirm_patient_info() 业务封装。
+    （就诊人字段比对已改为 graph.py 的纯代码归一化实现 simple_patient_match，不调 LLM）
     """
 
     def __init__(self):
@@ -159,36 +158,6 @@ class LLMOrchestrator:
         else:
             logger.error("结构化输出最终为空 %s", schema.__name__)
         return None
-
-    async def match_patient_info(
-        self,
-        collected: dict[str, Any],
-        confirmed: dict[str, Any],
-    ) -> tuple[bool, str]:
-        """校验患者信息是否匹配
-
-        Args:
-            collected: Agent 收集的患者信息
-            confirmed: 后端选择的就诊人信息
-
-        Returns:
-            (is_match, reason)
-        """
-        from app.agent.structured_output import PatientMatchResult
-
-        prompt = build_patient_match_prompt(collected, confirmed)
-
-        result = await self.ainvoke_structured(
-            PatientMatchResult,
-            [
-                {"role": "system", "content": build_patient_match_system_message()},
-                {"role": "system", "content": prompt},
-            ],
-        )
-        if result is None:
-            logger.error("就诊人匹配结构化输出为空，按不匹配保守处理")
-            return False, "就诊人信息校验失败，请重新确认"
-        return result.is_match, result.reason
 
     async def confirm_patient_info(
         self,

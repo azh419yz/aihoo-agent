@@ -10,13 +10,12 @@ import logging
 from fastapi import APIRouter
 
 from app.common.base_response import BaseResponse
-from app.common.dependencies import get_consultation_service
+from app.common.dependencies import get_consultation_service, get_session_service
 from app.common.exceptions import SessionNotFoundError
 from app.models.chat_schema import (
     ChatRequest,
     CreateSessionRequest,
 )
-from app.service.session_service import SessionService
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +36,7 @@ async def chat(request: ChatRequest):
 @router.post("/session", response_model=BaseResponse)
 async def create_session(request: CreateSessionRequest):
     """新建问诊会话"""
-    session_service = SessionService()
+    session_service = get_session_service()
     data = await session_service.get_or_create(
         request.session_id, request.patient_id
     )
@@ -55,7 +54,7 @@ async def create_session(request: CreateSessionRequest):
 @router.get("/session/{session_id}", response_model=BaseResponse)
 async def get_session(session_id: str):
     """获取会话状态"""
-    session_service = SessionService()
+    session_service = get_session_service()
     data = await session_service.get_session_all(session_id)
 
     if not data:

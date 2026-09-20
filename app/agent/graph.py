@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import operator
+import re
 from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -142,30 +143,69 @@ async def build_chat_messages(
     return messages
 
 
+# ============================================================
+# 就诊人比对：纯代码归一化（不调 LLM）
+# ============================================================
+
+# 性别别名：前端/后端 JSON、病历提取、患者口语的多种写法
+_MALE_ALIASES = {"男", "男性", "男患者", "male", "m", "man", "1"}
+_FEMALE_ALIASES = {"女", "女性", "女患者", "female", "f", "woman", "2"}
+
+_AGE_PATTERN = re.compile(r"\d+")
+
+
+def normalize_gender(value: Any) -> str:
+    """性别归一化：男/男性/male/m/1 → male；女/女性/female/f/2 → female
+
+    识别不出的原样返回（空值返回 ""，比对时视为无此信息、跳过该项）。
+    """
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if raw in _MALE_ALIASES:
+        return "male"
+    if raw in _FEMALE_ALIASES:
+        return "female"
+    # 兜底：含「男/女」字样的变体（如误并入性别字段的「男 46」）
+    if "男" in raw:
+        return "male"
+    if "女" in raw:
+        return "female"
+    return raw
+
+
+def normalize_age(value: Any) -> str:
+    """年龄归一化：46 / "46" / "46岁" → "46"；取不到数字返回 "" """
+    if value is None:
+        return ""
+    match = _AGE_PATTERN.search(str(value))
+    return match.group(0) if match else ""
+
+
 def simple_patient_match(collected: dict, confirmed: dict) -> tuple[bool, str]:
-    """简单的就诊人信息字段比较（不调用 LLM，避免额外延迟）
+    """就诊人信息字段比较（纯代码，不调用 LLM）
+
+    归一化后比对 gender 与 age。前端传 "male"、Agent 收集 "男"、后端年龄传
+    "46" 而对话提取为 46(int) —— 这类同义不同写必须判为一致，不能交给 LLM 逐字段对比。
 
     Returns:
         (is_match, reason) — reason 在匹配时为 ""
     """
     reasons = []
 
-    # 性别比较（归一化处理）
-    male_set = {"男", "male", "m", "1"}
-    female_set = {"女", "female", "f", "2"}
-
-    raw_cg = (collected.get("gender") or "").strip().lower()
-    raw_cog = (confirmed.get("gender") or "").strip().lower()
-    norm_cg = "male" if raw_cg in male_set else ("female" if raw_cg in female_set else raw_cg)
-    norm_cog = "male" if raw_cog in male_set else ("female" if raw_cog in female_set else raw_cog)
+    norm_cg = normalize_gender(collected.get("gender"))
+    norm_cog = normalize_gender(confirmed.get("gender"))
     if norm_cg and norm_cog and norm_cg != norm_cog:
-        reasons.append(f"性别不一致（对话收集：{collected.get('gender')}，系统记录：{confirmed.get('gender')}）")
+        reasons.append(
+            f"性别不一致（对话收集：{collected.get('gender')}，系统记录：{confirmed.get('gender')}）"
+        )
 
-    # 年龄比较
-    raw_age = str(collected.get("age") or "")
-    raw_cage = str(confirmed.get("age") or "")
-    if raw_age and raw_cage and raw_age != raw_cage:
-        reasons.append(f"年龄不一致（对话收集：{raw_age}岁，系统记录：{raw_cage}岁）")
+    norm_age = normalize_age(collected.get("age"))
+    norm_cage = normalize_age(confirmed.get("age"))
+    if norm_age and norm_cage and norm_age != norm_cage:
+        reasons.append(
+            f"年龄不一致（对话收集：{collected.get('age')}岁，系统记录：{confirmed.get('age')}岁）"
+        )
 
     return (False, "；".join(reasons)) if reasons else (True, "")
 
@@ -907,10 +947,14 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
 
         # 追加问诊进度（主诉链路是否已问清）
         progress = dict(state.get("inquiry_progress") or {})
-        chain_done = "是" if progress.get(CHIEF_COMPLAINT_DIMENSION) else "否"
+        # 进入本轮前是否已问清：progress 下面会被本轮覆盖更新，这里先取快照
+        chain_done_before = bool(progress.get(CHIEF_COMPLAINT_DIMENSION))
+        chain_done = "是" if chain_done_before else "否"
         system_prompt += (
             f"\n\n## 问诊进度\n- 主诉链路是否已问清：{chain_done}\n"
-            "- 主诉链路核心问题问清后，请在回复中自然引导付费。"
+            "- 尚未问清 → 继续围绕主诉链路追问，**本轮回复里不要出现「付费/支付/费用」等字眼**；\n"
+            "- 已问清 → 本轮只做「综合总结 + 初步判断 + 付费引导」，"
+            "**不得再提出任何新问题、不得给出待答选项**。"
         )
 
         # LLM 对话收集症状（带知识库上下文和历史）
@@ -975,13 +1019,34 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         latest_inquiry = inquiry_data if symptom_result else state.get("inquiry", {})
         if latest_inquiry:
             response_data.inquiry_json = InquiryJson(**latest_inquiry)
+
+        # 付费引导轮判定（任一成立即进入引导轮）：
+        #   ① 进入本轮前主诉链路已问清 → 之后每轮持续引导，
+        #      避免患者答完追问后付费入口消失（只有关键词命中才出卡片，时有时无）
+        #   ② 本轮刚问清（结构化 chief_complaint_done）
+        #   ③ 兜底：LLM 回复里已出现付费引导措辞
         chain_done_now = bool(symptom_result and symptom_result.chief_complaint_done)
-        if chain_done_now or any(kw in llm_response for kw in ["付费", "支付", "费用"]):
-            response_data.need_pay = True
-        # 问答选项（QuestionChoices 结构化提取）
-        await _set_choices(
-            response_data, orchestrator, state.get("request_message", ""), llm_response
+        pay_guided = (
+            chain_done_before
+            or chain_done_now
+            or any(kw in llm_response for kw in ["付费", "支付", "费用"])
         )
+        response_data.need_pay = pay_guided
+
+        # 付费引导轮与追问互斥：引导付费时不再输出问答选项。
+        # 否则前端会同时渲染「立即购买」卡片和待答 chips —— 一边追问一边收费，
+        # 患者不知道是付钱还是答问题（2026-09-20 修）。
+        if pay_guided:
+            logger.info(
+                "主诉链路已问清（before=%s / now=%s），本轮为付费引导轮，抑制问答选项",
+                chain_done_before,
+                chain_done_now,
+            )
+        else:
+            # 问答选项（QuestionChoices 结构化提取）
+            await _set_choices(
+                response_data, orchestrator, state.get("request_message", ""), llm_response
+            )
 
         updates["response_text"] = llm_response
         updates["response_action"] = ActionType.CHAT
@@ -1111,9 +1176,12 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
     async def selecting_patient(state: dict[str, Any]) -> dict:
         """选择就诊人：比对收集信息与选定就诊人
 
+        字段比对统一走 simple_patient_match（纯代码归一化：男≡male、46≡"46岁"），
+        不调 LLM —— LLM 只负责「待确认中用户回复」的意图语义确认。
+
         规则：
           - 无就诊人信息（付费后未选）→ 追问 need_select=true
-          - action=SELECT_PATIENT → 确定/切换就诊人，直接比对；不一致 → need_select=true 待确认
+          - action=SELECT_PATIENT → 确定/切换就诊人，归一化比对；不一致 → need_select=true 待确认
           - action=CHAT 且消息修改了收集数据（如"年龄是35岁"）→ 更新收集数据并重比
           - action=CHAT 待确认中 → 语义确认/否认（confirm 放行 / disagree 重新选择）
         """
@@ -1161,10 +1229,11 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         if collected_changed:
             updates["patient_info"] = collected
 
-        # ② 分支判定：SELECT_PATIENT（确定/切换）→ 直接比对；
-        #    CHAT 修改了收集数据 → 重比；CHAT 待确认中 → 语义确认/否认；否则首次比对
+        # ② 分支判定：SELECT_PATIENT（确定/切换）→ 代码归一化比对；
+        #    CHAT 修改了收集数据 → 重比；CHAT 待确认中 → LLM 语义确认/否认；否则首次比对
+        #    比对统一走 simple_patient_match（男≡male、46≡"46岁"），不交 LLM 逐字段对比
         if action == ActionType.SELECT_PATIENT.value or collected_changed:
-            is_match, reason = await orchestrator.match_patient_info(collected, confirmed)
+            is_match, reason = simple_patient_match(collected, confirmed)
         elif pending:
             semantic, analysis = await orchestrator.confirm_patient_info(
                 collected, confirmed, mismatch_reason, user_msg
@@ -1200,8 +1269,8 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             updates["response_data"] = ResponseData(patient_mismatch=True)
             return updates
         else:
-            # 首次进入（无待确认）→ 对比信息
-            is_match, reason = await orchestrator.match_patient_info(collected, confirmed)
+            # 首次进入（无待确认）→ 代码归一化比对
+            is_match, reason = simple_patient_match(collected, confirmed)
 
         # ③ 比对结果处理（SELECT_PATIENT / 修改后重比 / 首次进入 共用）
         if is_match:
@@ -1373,8 +1442,8 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 if not has_photos or _is_reupload_photo_intent(state.get("request_message", "")):
                     response_data.need_upload_image = True
                 await _set_choices(
-                response_data, orchestrator, state.get("request_message", ""), llm_response
-            )
+                    response_data, orchestrator, state.get("request_message", ""), llm_response
+                )
                 updates["response_text"] = llm_response
                 updates["response_action"] = ActionType.CHAT
                 updates["response_data"] = response_data
@@ -1472,8 +1541,8 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             if not has_photos or _is_reupload_photo_intent(state.get("request_message", "")):
                 response_data.need_upload_image = True
             await _set_choices(
-            response_data, orchestrator, state.get("request_message", ""), llm_response
-        )
+                response_data, orchestrator, state.get("request_message", ""), llm_response
+            )
             updates["response_text"] = llm_response
             updates["response_action"] = ActionType.CHAT
             updates["response_data"] = response_data
@@ -1593,8 +1662,8 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             )
             # 答疑轮若在提问且含备选（如"是继续调理还是复查"）→ 结构化提取问答选项
             await _set_choices(
-            response_data, orchestrator, request_message, llm_response
-        )
+                response_data, orchestrator, request_message, llm_response
+            )
             return {
                 "response_text": llm_response,
                 "response_action": ActionType.DIAGNOSIS,
