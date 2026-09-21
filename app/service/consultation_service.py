@@ -40,9 +40,10 @@ class ConsultationService:
         """
         session_id = request.session_id
 
-        # 1. 加载/创建会话
+        # 1. 加载/创建会话（传入 action/paid 用于识别状态丢失，不接受静默新建）
         session_data = await self.session_service.get_or_create(
-            session_id, request.patient_id
+            session_id, request.patient_id,
+            action=request.action, paid=request.paid,
         )
 
         # 2. 前置 action 校验（原 StateMachine.get_allowed_actions，类已退役删除）

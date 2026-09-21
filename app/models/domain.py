@@ -31,6 +31,26 @@ class ConsultationSession(BaseModel):
     )
     image_urls: list[str] | None = Field(default=None, description="舌照/面照 URL 列表")
 
+    # 问诊编排中间态（2026-09-21 补列：此前这些字段只在 Redis，
+    # Redis 键过期后从 MySQL 恢复会整段丢失，用户被迫重复问诊）
+    inquiry_progress: dict[str, Any] | None = Field(
+        default=None, description="问诊维度进度（主诉 + 6 个系统维度 → bool）"
+    )
+    preliminary_diagnosis: dict[str, Any] | None = Field(
+        default=None, description="付费后初步辨证结果"
+    )
+    hos_sick_info: dict[str, Any] | None = Field(
+        default=None, description="后端传入的就诊人信息（原始入参）"
+    )
+    tongue_analysis: list[Any] | None = Field(default=None, description="舌象分析结果")
+    face_analysis: list[Any] | None = Field(default=None, description="面象分析结果")
+    collecting_round: int | None = Field(default=None, description="基础信息收集轮次")
+    med_record_pending_confirm: bool = Field(default=False, description="病历待用户确认")
+    offline_medical_record: dict[str, Any] | None = Field(
+        default=None, description="线下病历处理状态（已处理图片 URL 等）"
+    )
+    patient_select_pending: bool = Field(default=False, description="就诊人信息待用户确认")
+
     patient_mismatch: bool = Field(default=False, description="患者信息是否不匹配")
     mismatch_reason: str | None = Field(default=None, description="不匹配原因")
 

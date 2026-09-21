@@ -673,11 +673,11 @@ async def perform_diagnosis(
     analysis = diagnosis_dict.get("analysis", "")
     principle = diagnosis_dict.get("treatment_principle", "")
 
-    response = f"【辨证结果】\n\n**辨病**：{disease}\n**证型**：{syndrome}\n"
+    response = f"【辨证结果】\n\n辨病：{disease}\n证型：{syndrome}\n"
     if principle:
-        response += f"**治法**：{principle}\n\n"
+        response += f"治法：{principle}\n\n"
     if analysis:
-        response += f"**分析**：{analysis}\n\n"
+        response += f"分析：{analysis}\n\n"
     # 不含流程引导文字，调用方通过 action 字段决定下一步
 
     return diagnosis_dict, response, ResponseData(
@@ -1740,8 +1740,11 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 orchestrator=orchestrator,
             )
             logger.info(
-                "处方来源: matched=%s query=%s",
-                bool(reason and reason.get("matched")), rag_query[:80],
+                "处方来源: matched=%s analysis=%s 候选案例=%d query=%s",
+                bool(reason and reason.get("matched")),
+                (reason or {}).get("analysis", ""),
+                len(results),
+                rag_query[:80],
             )
 
         # 构建回复（有处方 → 药物列表；无匹配 → 提示交医生填写）

@@ -289,6 +289,13 @@ async def retrieve_with_filter(
             if abs(a - age) > age_range:
                 continue
         filtered.append(r)
+
+    # 打全链路计数：命中数 / 过滤后数 —— 用于区分「检索没命中」与
+    # 「被性别年龄过滤剔空」（病例文本不符合 男｜33岁 格式时会被整批剔除）
+    logger.info(
+        "expert 库检索: 命中=%d 过滤后=%d (gender=%s age=%s ±%d)",
+        len(results), len(filtered), gender_cn, age, age_range,
+    )
     return filtered[:top_k]
 
 

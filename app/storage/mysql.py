@@ -65,13 +65,23 @@ class MySQLClient:
                      patient_info_collected, patient_info_confirmed,
                      chief_complaint, inquiry_json,
                      diagnosis_json, prescription_json,
-                     image_urls, patient_mismatch, mismatch_reason)
+                     image_urls, prescription_reason,
+                     inquiry_progress, preliminary_diagnosis, hos_sick_info,
+                     tongue_analysis, face_analysis, collecting_round,
+                     med_record_pending_confirm, offline_medical_record,
+                     patient_select_pending,
+                     patient_mismatch, mismatch_reason)
                 VALUES
                     (:session_id, :patient_id, :status, :paid,
                      :patient_info_collected, :patient_info_confirmed,
                      :chief_complaint, :inquiry_json,
                      :diagnosis_json, :prescription_json,
-                     :image_urls, :patient_mismatch, :mismatch_reason)
+                     :image_urls, :prescription_reason,
+                     :inquiry_progress, :preliminary_diagnosis, :hos_sick_info,
+                     :tongue_analysis, :face_analysis, :collecting_round,
+                     :med_record_pending_confirm, :offline_medical_record,
+                     :patient_select_pending,
+                     :patient_mismatch, :mismatch_reason)
             """)
             await db_session.execute(query, {
                 "session_id": session.session_id,
@@ -85,6 +95,16 @@ class MySQLClient:
                 "diagnosis_json": _to_json(session.diagnosis_json),
                 "prescription_json": _to_json(session.prescription_json),
                 "image_urls": _to_json(session.image_urls),
+                "prescription_reason": _to_json(session.prescription_reason),
+                "inquiry_progress": _to_json(session.inquiry_progress),
+                "preliminary_diagnosis": _to_json(session.preliminary_diagnosis),
+                "hos_sick_info": _to_json(session.hos_sick_info),
+                "tongue_analysis": _to_json(session.tongue_analysis),
+                "face_analysis": _to_json(session.face_analysis),
+                "collecting_round": session.collecting_round,
+                "med_record_pending_confirm": session.med_record_pending_confirm,
+                "offline_medical_record": _to_json(session.offline_medical_record),
+                "patient_select_pending": session.patient_select_pending,
                 "patient_mismatch": session.patient_mismatch,
                 "mismatch_reason": session.mismatch_reason,
             })
@@ -93,7 +113,9 @@ class MySQLClient:
     _JSON_FIELDS = {
         "patient_info_collected", "patient_info_confirmed",
         "inquiry_json", "diagnosis_json", "prescription_json",
-        "image_urls",
+        "image_urls", "prescription_reason",
+        "inquiry_progress", "preliminary_diagnosis", "hos_sick_info",
+        "tongue_analysis", "face_analysis", "offline_medical_record",
     }
 
     async def get_session(self, session_id: str) -> ConsultationSession | None:
