@@ -41,6 +41,19 @@ class ActionType(str, Enum):
     PRESCRIBE = "PRESCRIBE"  # 开具处方
 
 
+# 付费后才能进入的状态（与模块顶部的 unpaid / paid 分组一致）。
+# 这些状态下的每轮请求必须显式带 paid=true，否则 ConsultationService 前置校验
+# 返回 PAYMENT_REQUIRED(2005)（2026-09-21 加：此前付费状态只在 INQUIRY 阶段
+# 被消费一次，付费后传 paid=false 会被静默放行）。
+PAID_STATES: frozenset[SessionState] = frozenset({
+    SessionState.PRELIMINARY_DIAGNOSIS,
+    SessionState.SELECTING_PATIENT,
+    SessionState.UPLOADING_IMAGES,
+    SessionState.DIAGNOSIS,
+    SessionState.PRESCRIBING,
+})
+
+
 # 各状态下支持的 Action
 STATE_ACTIONS: dict[SessionState, list[ActionType]] = {
     SessionState.COLLECTING_BASIC: [ActionType.CHAT, ActionType.COLLECT_BASIC_INFO],

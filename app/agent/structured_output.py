@@ -52,8 +52,20 @@ class SymptomExtraction(BaseModel):
         default_factory=dict,
         description="各已覆盖维度的文本总结，如 {'sleep': '入睡难，多梦'}",
     )
+    covered_chain_points: list[str] = Field(
+        default_factory=list,
+        description=(
+            "付费前主诉链路中，**本轮实际核实过**的必问点 id（取值由系统在提取提示词里给出，"
+            "形如 A1/B2）：只有患者本轮明确回答了的点才填；本轮没问到、或只是顺带提了一句"
+            "而无答案的点，一律不要填"
+        ),
+    )
     chief_complaint_done: bool = Field(
-        default=False, description="付费前主诉链路是否已问清（问清后应引导付费）"
+        default=False,
+        description=(
+            "辅助信号：LLM 认为付费前主诉链路可以收口了（最终以代码判定的链路必问点是否"
+            "覆盖为准，见 graph.CHAIN_POINTS / chain_done）"
+        ),
     )
 
     need_more_info: bool = Field(default=True, description="是否还需要更多信息")

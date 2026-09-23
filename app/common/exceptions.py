@@ -50,6 +50,21 @@ class StateTransitionError(BusinessException):
         )
 
 
+class PaymentRequiredError(BusinessException):
+    """付费后阶段缺少付费标记
+
+    付费后状态（见 state_machine.PAID_STATES）的每轮请求必须显式带 paid=true，
+    否则无法区分「已付费用户」与「越权/脏数据」。
+    """
+
+    def __init__(self, current_state: str):
+        super().__init__(
+            code=ResponseCode.PAYMENT_REQUIRED.code,
+            message=f"该阶段需付费后使用（当前状态: {current_state}）",
+            data={"current": current_state, "required": "paid=true"},
+        )
+
+
 class LLMServiceError(AppException):
     """LLM 服务异常"""
     pass

@@ -31,6 +31,19 @@ CREATE TABLE IF NOT EXISTS consultation_sessions (
     diagnosis_json JSON COMMENT '辨病辨证结果',
     prescription_json JSON COMMENT '处方信息',
     image_urls JSON COMMENT '舌照/面照 URL 列表',
+    prescription_reason JSON COMMENT '开方选案分析原因（审计用，不展示给用户）',
+
+    -- 问诊编排中间态（2026-09-21 补列：此前这些字段只存在于 Redis，
+    -- Redis 键过期后从 MySQL 恢复会整段丢失，用户被迫重复问诊）
+    inquiry_progress JSON COMMENT '问诊维度进度（主诉 + 6 个系统维度 → bool）',
+    preliminary_diagnosis JSON COMMENT '付费后初步辨证结果',
+    hos_sick_info JSON COMMENT '后端传入的就诊人信息（原始入参）',
+    tongue_analysis JSON COMMENT '舌象分析结果',
+    face_analysis JSON COMMENT '面象分析结果',
+    collecting_round INT DEFAULT 0 COMMENT '基础信息收集轮次',
+    med_record_pending_confirm BOOLEAN DEFAULT FALSE COMMENT '病历待用户确认',
+    offline_medical_record JSON COMMENT '线下病历处理状态（已处理图片 URL 等）',
+    patient_select_pending BOOLEAN DEFAULT FALSE COMMENT '就诊人信息待用户确认',
 
     -- 校验
     patient_mismatch BOOLEAN DEFAULT FALSE COMMENT '患者信息是否不匹配',

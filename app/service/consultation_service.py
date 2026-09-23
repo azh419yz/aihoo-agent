@@ -12,9 +12,10 @@ import logging
 
 from app.agent.graph import build_consultation_graph
 from app.agent.orchestrator import LLMOrchestrator
-from app.agent.state_machine import STATE_ACTIONS, ActionType, SessionState
+from app.agent.state_machine import PAID_STATES, STATE_ACTIONS, ActionType, SessionState
 from app.common.exceptions import (
     LLMServiceError,
+    PaymentRequiredError,
     StateTransitionError,
 )
 from app.models.chat_schema import ChatRequest, ChatResponse
@@ -48,15 +49,28 @@ class ConsultationService:
 
         # 2. 前置 action 校验（原 StateMachine.get_allowed_actions，类已退役删除）
         state_value = session_data.get("state", SessionState.COLLECTING_BASIC.value)
+        current_state = SessionState(state_value)
         action = ActionType(request.action)
-        allowed = STATE_ACTIONS.get(SessionState(state_value), [ActionType.CHAT])
+        allowed = STATE_ACTIONS.get(current_state, [ActionType.CHAT])
         if action not in allowed:
             raise StateTransitionError(
                 current_state=state_value,
                 target_state=f"action={action.value}",
             )
 
-        # 3. 构造 initial state（会话持久化字段 + 本次请求输入）
+        # 3. 前置付费校验：付费后状态必须显式带 paid=true（2026-09-21 加）
+        # 判据用「请求的 paid」而非「会话 paid」：会话 paid 只在 INQUIRY 阶段被
+        # 消费一次并写入，此后付费后节点内部一律硬编码 paid=True，导致请求传
+        # false 也能静默推进（线上实测 UPLOADING_IMAGES + paid=false 被放行）。
+        # 按调用契约（api-调用手册 §3.3/§3.5），付费后每轮都应带 paid=true。
+        if current_state in PAID_STATES and not request.paid:
+            logger.error(
+                "付费后状态缺少付费标记，拒绝处理: session=%s state=%s paid=%s",
+                session_id, state_value, request.paid,
+            )
+            raise PaymentRequiredError(current_state=state_value)
+
+        # 4. 构造 initial state（会话持久化字段 + 本次请求输入）
         initial: dict = {
             key: session_data[key]
             for key in SESSION_FIELD_NAMES

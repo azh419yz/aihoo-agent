@@ -25,6 +25,7 @@ class ResponseCode(Enum):
     INVALID_STATE_TRANSITION = (2002, "状态流转非法")
     PATIENT_MISMATCH = (2003, "就诊人信息不匹配")
     DUPLICATE_SESSION = (2004, "会话已存在")
+    PAYMENT_REQUIRED = (2005, "需付费后使用")
 
     # 三方服务错误 (3xxx)
     LLM_SERVICE_ERROR = (3000, "LLM 服务调用失败")

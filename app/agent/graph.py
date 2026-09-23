@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import operator
 import re
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, NamedTuple, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
@@ -365,7 +365,10 @@ def _apply_extracted_basic_fields(collected: dict, result: Any, user_msg: str) -
     return changed
 
 
-# 付费前主诉维度（主诉链路是否问清）
+# 付费前主诉维度（covered_dimensions 的取值之一）。
+# 注意：付费前「链路是否问清」自 2026-09-23 起改由代码按链路必问点判定（chain_done），
+# 不再用 covered_dimensions 里的 chief_complaint 当判据——二者语义不同：
+# 前者是「本轮消息涉及主诉话题」，后者是「整条链路的核心问题都问完并得到回答」。
 CHIEF_COMPLAINT_DIMENSION = "chief_complaint"
 # 付费后系统问诊维度（固定顺序）
 SYSTEMIC_DIMENSIONS = ["sleep", "diet", "stool", "urine", "emotion", "thermo"]
@@ -373,6 +376,105 @@ SYSTEMIC_DIMENSIONS = ["sleep", "diet", "stool", "urine", "emotion", "thermo"]
 # MIN 为强制保底轮数；达到 MIN 后每轮做「信息充分度」判定，足够即提前转辨证，MAX 兜底强制转
 MALE_INQUIRY_MIN_ROUNDS = 2
 MALE_INQUIRY_MAX_ROUNDS = 10
+
+
+# ============================================================
+# 付费前主诉链路：链路 A-D 必问点（确定性推进）
+# ============================================================
+# 2026-09-23：此前「主诉链路是否问清」完全交给 LLM 单轮判定，且与 covered_dimensions
+# 的 chief_complaint 语义混用——患者回答一句与主诉沾边的话就会被记为「chief_complaint
+# 维度已覆盖」，而该键又被当成「主诉链路已问清」永久粘滞。实测（会话 e997a470-…，
+# logs/agent.log 2026-09-22 11:17:14）：链路 A 只问了 2 个点就 need_pay=true，且同轮
+# 还在追问「手淫/性生活频率」——一边追问一边收费。
+#
+# 现在改为确定性判定（与付费后系统问诊同构）：
+#   · 代码展开链路必问点 → 每轮指定「本轮必须核实」的点写进 Prompt；
+#   · LLM 上报 covered_chain_points，代码 clamp（只收最靠前的两个点，防跳步）；
+#   · 收口判据 = 必问点全覆盖（主判）→ LLM chief_complaint_done（辅助）→ MAX 轮兜底。
+CHAIN_DONE_KEY = "chain_done"           # 是否已收口（粘滞，收口后每轮持续引导付费）
+CHAIN_DONE_SRC_KEY = "chain_done_src"   # 收口来源 code/llm/max（仲裁 + 审计）
+CHAIN_CHAINS_KEY = "chains"             # 已锁定的链路集合（首次识别后固定，防漂移）
+CHAIN_REQUIRED_KEY = "chain_required"   # 累计必问点 id（只增不减，防集合缩水导致提前收口）
+CHAIN_POINTS_KEY = "chain_points"       # {点 id: True} 已核实（问到并得到回答）
+CHAIN_ASKED_KEY = "chain_asked"         # 上一轮系统指定的必核点 id（漏报兜底用）
+INQUIRY_ROUND_KEY = "inquiry_round"     # 付费前 INQUIRY 轮次计数
+
+# 付费前追问轮数：规范 5-8 轮。MIN 为下限（未达下限一律不出付费卡片），
+# MAX 为强制收口兜底（必问点清单与真实对话不匹配时也不会卡死）
+INQUIRY_MIN_ROUNDS = 3
+INQUIRY_MAX_ROUNDS = 8
+
+
+class ChainPoint(NamedTuple):
+    """付费前链路必问点
+
+    id    点编号（A1/B2/…），写进 inquiry_progress["chain_points"] 与 Prompt
+    label 必核内容，同时作为参考问法注入 Prompt
+    when  触发关键词：非空 = 主诉/症状命中其一才必问（不命中自动跳过，避免卡死）
+    group 合并组：多条链路同时命中时同组只保留第一个点（避免重复问同一件事）
+    """
+
+    id: str
+    label: str
+    when: tuple[str, ...] = ()
+    group: str = ""
+
+
+CHAIN_DEFS: dict[str, dict[str, Any]] = {
+    "A": {
+        "name": "勃起功能障碍",
+        "keywords": ("勃起", "阳痿", "硬度", "举而不坚", "疲软", "不举", "性功能"),
+        "points": (
+            ChainPoint("A1", "晨勃情况（有/无/明显减少）"),
+            ChainPoint("A2", "起病方式（突然出现还是逐渐加重）"),
+            ChainPoint("A3", "分支追问：近期压力情绪大 → 睡眠与情绪；劳累渐进 → 怕冷怕热与腰酸"),
+            ChainPoint("A4", "手淫/性生活频率、是否劳累过度", when=("晨勃",)),
+            ChainPoint("A5", "是否合并尿频尿急尿痛（前列腺）或早泄", group="cross"),
+        ),
+    },
+    "B": {
+        "name": "早泄",
+        "keywords": ("早泄", "射精快", "射精过快", "时间短", "秒射", "坚持不住"),
+        "points": (
+            ChainPoint("B1", "早泄是原发（一直有）还是继发（最近出现）"),
+            ChainPoint("B2", "诱因：压力/焦虑，或前列腺炎"),
+            ChainPoint("B3", "勃起功能是否正常", group="cross"),
+            ChainPoint("B4", "阴囊潮湿/瘙痒（有则追小便灼热、口苦口臭）"),
+            ChainPoint("B5", "手淫/性生活频率高者 → 腰酸、精神、健忘"),
+        ),
+    },
+    "C": {
+        "name": "尿路/前列腺",
+        "keywords": ("尿频", "尿急", "尿痛", "尿无力", "排尿困难", "尿分叉", "尿灼热",
+                     "尿线细", "前列腺", "夜尿", "尿不尽", "尿等待"),
+        "points": (
+            ChainPoint("C1", "排尿是否费力、尿线变细、夜尿多"),
+            ChainPoint("C2", "会阴/睾丸/腹股沟/阴囊是否坠胀疼痛"),
+            ChainPoint("C3", "发热、尿道分泌物", when=("尿灼热", "尿痛", "尿疼", "排尿痛")),
+            ChainPoint("C4", "血尿：全程还是初段、颜色、有无血块（并建议就医）",
+                       when=("血尿", "尿血")),
+            ChainPoint("C5", "阴囊潮湿瘙痒；是否合并勃起问题/早泄", group="cross"),
+        ),
+    },
+    "D": {
+        "name": "男性不育",
+        "keywords": ("不育", "不孕", "精液", "精子", "畸形率", "备孕"),
+        "points": (
+            ChainPoint("D1", "未避孕未孕多久（≥1年）"),
+            ChainPoint("D2", "精液检查结果（数量/活力/畸形率）"),
+            ChainPoint("D3", "阴囊坠胀/蚯蚓状静脉（精索静脉曲张）"),
+            ChainPoint("D4", "既往腮腺炎/泌尿生殖感染/手术史"),
+            ChainPoint("D5", "是否腰酸/怕冷/五心烦热"),
+        ),
+    },
+}
+
+CHAIN_ORDER = ("A", "B", "C", "D")
+
+# 点 id → 定义（必问点集合以 id 持久化，取回后用这张表还原描述）
+POINT_BY_ID: dict[str, ChainPoint] = {
+    p.id: p for chain in CHAIN_DEFS.values() for p in chain["points"]
+}
 
 # 辨证前的补充信息确认轮：男科追问完成后、正式辨证前，多问一轮「是否有其他补充」，
 # 用户回复后（无论有无补充）才进入正式辨证，避免遗漏手术史/用药/家族史等关键信息
@@ -392,6 +494,179 @@ MED_RECORD_CONFIRM_OPTIONS = [
         options=["确认"],
     ),
 ]
+
+
+def chain_context(state: dict[str, Any]) -> str:
+    """链路识别/条件点判定的文本上下文：主诉 + 症状 + 最近用户原话
+
+    只取主诉字段会漏——实测会话的 chief_complaint 是「患者30岁，主诉晨勃明显减少」，
+    里面没有「勃起困难」字样，链路 A 必须靠 inquiry.symptoms（含「难以勃起」）与
+    患者自己说的「阳痿」才能识别出来。
+    """
+    parts = [
+        str(state.get("chief_complaint") or ""),
+        str((state.get("patient_info") or {}).get("chief_complaint") or ""),
+        "，".join((state.get("inquiry") or {}).get("symptoms") or []),
+    ]
+    for msg in (state.get("messages") or [])[-20:]:
+        if msg.get("role") == "user":
+            parts.append(str(msg.get("content") or ""))
+    parts.append(str(state.get("request_message") or ""))
+    return " ".join(p for p in parts if p)
+
+
+def detect_chains(context: str) -> list[str]:
+    """识别主诉命中的链路（A/B/C/D，可多条），按 CHAIN_ORDER 返回"""
+    return [
+        chain for chain in CHAIN_ORDER
+        if any(kw in context for kw in CHAIN_DEFS[chain]["keywords"])
+    ]
+
+
+def required_chain_points(chains: list[str], context: str) -> list[ChainPoint]:
+    """展开必问点：按链路顺序拼接，条件点未命中则跳过，同 group 只保留第一个
+
+    多条链路同时命中时（如主诉兼有勃起障碍与早泄）点数可能超过轮数上限：
+    按顺序截断到 INQUIRY_MAX_ROUNDS 个 —— 保证靠前（主）链路的点问全，
+    靠后链路只取其前几点，避免「必问点永远问不完、只能靠 MAX 兜底收口」。
+    """
+    points: list[ChainPoint] = []
+    seen_groups: set[str] = set()
+    for chain in chains:
+        for point in CHAIN_DEFS[chain]["points"]:
+            if point.when and not any(kw in context for kw in point.when):
+                continue
+            if point.group:
+                if point.group in seen_groups:
+                    continue
+                seen_groups.add(point.group)
+            points.append(point)
+    if len(points) > INQUIRY_MAX_ROUNDS:
+        logger.info(
+            "付费前链路必问点 %s 个 > 轮数上限 %s，按顺序截断",
+            len(points), INQUIRY_MAX_ROUNDS,
+        )
+        points = points[:INQUIRY_MAX_ROUNDS]
+    return points
+
+
+def symptom_chain_context(state: dict[str, Any]) -> str:
+    """追加链路用的上下文：只用**结构化已确认症状** + 主诉，不含原始对话
+
+    首次识别可以宽松（先把主诉链路抓住），但中途追加链路必须收紧：
+    原始对话里「没有尿频尿急」这类否定句同样含触发词，会让已经问完的患者
+    被追加一条并不成立的链路（白问好几轮）。症状列表是 LLM 提取的已确认结果，
+    没有这个噪音。
+    """
+    parts = [
+        str(state.get("chief_complaint") or ""),
+        str((state.get("patient_info") or {}).get("chief_complaint") or ""),
+        "，".join((state.get("inquiry") or {}).get("symptoms") or []),
+    ]
+    return " ".join(p for p in parts if p)
+
+
+def resolve_chains(
+    progress: dict, context: str, symptom_context: str = ""
+) -> list[str]:
+    """链路集合：首次识别后**锁定**，收口前允许并入新识别出的链路
+
+    不锁定会漂移——患者后续轮次里冒出「尿不尽」等词就会新增 C 链路，必问点集合
+    随之变化（实测：链路 A 问到第 5 个点时被判成「C 链路还没核实」→ 永远收不了口）。
+    追加只认结构化症状（symptom_context），避免否定句误触发；收口后冻结，
+    避免付费入口已经给出又冒出新的必问点。
+    """
+    chains = progress.get(CHAIN_CHAINS_KEY)
+    if not chains:
+        chains = detect_chains(context)
+        progress[CHAIN_CHAINS_KEY] = chains
+        return chains
+    if not progress.get(CHAIN_DONE_KEY):
+        append_ctx = symptom_context or context
+        fresh = [c for c in detect_chains(append_ctx) if c not in chains]
+        if fresh:
+            logger.info("付费前链路追加：%s（依据已确认症状）", fresh)
+            chains = list(chains) + fresh
+            progress[CHAIN_CHAINS_KEY] = chains
+    return list(chains)
+
+
+def required_chain_points_stable(
+    progress: dict, chains: list[str], context: str
+) -> list[ChainPoint]:
+    """必问点集合（只增不减，落库在 progress["chain_required"]）
+
+    每轮按当前上下文重新展开，结果可能与上一轮不同（条件点随上下文出现、会话窗口
+    滚动又会让它消失），直接拿它当判据会让「还剩几个点」忽多忽少 → 收口时点飘忽。
+    这里取并集：已进入必问集合的点不会被移除，收口只可能发生在所有点都核实之后。
+    """
+    required_ids = list(progress.get(CHAIN_REQUIRED_KEY) or [])
+    for point in required_chain_points(chains, context):
+        if point.id not in required_ids:
+            required_ids.append(point.id)
+    if len(required_ids) > INQUIRY_MAX_ROUNDS:
+        required_ids = required_ids[:INQUIRY_MAX_ROUNDS]
+    progress[CHAIN_REQUIRED_KEY] = required_ids
+    return [POINT_BY_ID[i] for i in required_ids if i in POINT_BY_ID]
+
+
+def chain_remaining(progress: dict, chains: list[str], context: str) -> list[ChainPoint]:
+    """尚未核实（问到并得到患者回答）的必问点，按顺序返回
+
+    注意：会顺带把「累计必问点集合」写回 progress（集合只增不减）。
+    """
+    covered = progress.get(CHAIN_POINTS_KEY) or {}
+    return [p for p in required_chain_points_stable(progress, chains, context)
+            if not covered.get(p.id)]
+
+
+def _clamp_chain_points(reported: list[str], remaining: list[ChainPoint]) -> list[str]:
+    """clamp：只接受剩余点中最靠前的两个（防 LLM 跳步 / 一次性刷满整条链路）"""
+    allowed = {p.id for p in remaining[:2]}
+    return [pid for pid in (reported or []) if pid in allowed]
+
+
+def _format_chains(chains: list[str]) -> str:
+    """链路的中文描述（Prompt/日志用）"""
+    if not chains:
+        return "未识别（先问清主诉再落链路）"
+    return "、".join(f"{c} {CHAIN_DEFS[c]['name']}" for c in chains)
+
+
+def build_chain_hint(chain_points: list[ChainPoint], remaining: list[ChainPoint]) -> str:
+    """症状提取提示词里的链路必核点说明（LLM 据此回报 covered_chain_points）
+
+    必须把 id 词汇表给到提取器——否则它无从回报「本轮核实了哪个点」。
+    """
+    if not chain_points:
+        return ""
+    done = [p for p in chain_points if p not in remaining]
+    lines = [
+        "本轮必核点：" + (
+            f"{remaining[0].id} {remaining[0].label}" if remaining else "无（链路已问清）"
+        ),
+    ]
+    if len(remaining) > 1:
+        lines.append(f"可顺带核实：{remaining[1].id} {remaining[1].label}")
+    if done:
+        lines.append("已核实过：" + "、".join(p.id for p in done))
+    lines.append(
+        "全部可选 id：" + "；".join(f"{p.id}={p.label}" for p in chain_points)
+    )
+    lines.append(
+        "只有患者**本轮明确回答**了的点才填进 covered_chain_points；"
+        "本轮没问到、或只是顺带提了一句而没有答案的点，一律不要填。"
+    )
+    return "\n".join(lines)
+
+
+def _looks_like_question(text: str) -> bool:
+    """回复是否在向患者提问（用于付费轮/追问轮的互斥仲裁）
+
+    只判「有没有在问」，不判问得好不好：问号、结尾的「吗/呢」都算。
+    """
+    text = text or ""
+    return "？" in text or "?" in text or text.rstrip().endswith(("吗", "呢"))
 
 
 def _systemic_done(progress: dict) -> bool:
@@ -497,12 +772,135 @@ async def _extract_supplement_info(
     return inquiry_data
 
 
+def _first_analysis_item(items: list | None) -> dict:
+    """取分析结果列表中第一个非空项（兼容 Pydantic 对象与 dict）"""
+    for item in items or []:
+        if hasattr(item, "model_dump"):
+            item = item.model_dump()
+        if isinstance(item, dict) and item:
+            return item
+    return {}
+
+
+def _photo_field(label: str, value: str | None) -> str:
+    """拼「前缀 + 值」；值为空返回空串（供 filter 剔除）"""
+    text = (value or "").strip()
+    return f"{label}{text}" if text else ""
+
+
+def _photo_block(title: str, detail: str, analysis: str, fail_hint: str) -> str:
+    """拼一个舌象/面象块：标题+特征行 / 分析行；分析失败则只给重传提示"""
+    if "分析失败" in analysis:
+        return f"{title}\n{fail_hint}"
+    head = f"{title}{detail}。" if detail else title
+    return f"{head}\n{analysis}" if analysis else head
+
+
+def _prepend_photo_summary(summary: str, text: str) -> str:
+    """本轮上传了舌面照时把分析小结前置到回复；无小结则原样返回"""
+    return f"{summary}\n\n{text}" if summary else text
+
+
+def build_photo_prompt_hint(photo_summary: str) -> str:
+    """舌面照播报后给 LLM 的约束块（系统问诊 / 男科追问共用）
+
+    系统已把分析结论确定性前置到本轮回复（见 build_photo_analysis_summary），
+    LLM 只需把话头接到下一个问题。分两种情况给约束：
+
+    - 分析成功：禁止复述舌色/舌体/苔/面色等具体特征（会与系统播报重复）。
+    - 分析失败（播报里含「分析未成功」）：此时照片**没有被识别**，LLM 若声称
+      「已看到/已分析照片」并描述舌象面象就是凭空编造。2026-09-23 端到端实测：
+      模板播报「分析未成功」后 LLM 仍写「这次收到照片后我仔细看了」，故单独收严。
+    """
+    if not photo_summary:
+        return ""
+    hint = (
+        "\n\n## 患者刚上传舌面照\n"
+        f"系统已向患者播报以下分析结论：\n{photo_summary}\n"
+        "- 本轮回复**不要重复播报**上述内容：不要复述舌色/舌体/苔/面色/唇色等具体特征，"
+        "也不要用「收到/好的/已看到您的照片」开头；\n"
+    )
+    if "分析未成功" in photo_summary:
+        hint += (
+            "- 播报里出现「分析未成功」说明**本次照片没有被识别**：本轮"
+            "**绝对不要描述任何舌象/面象特征，也不要声称已经看过或分析过照片**；\n"
+            "- 也**不要复述「重新拍摄」的拍摄要求**（系统已给出具体话术），"
+            "用一句自然过渡带过（如「这次照片没能识别成功，麻烦重新拍一下」）后"
+            "直接引出下一个问题；\n"
+            "- **不要承诺「稍后播报/后续分析」**——本次就是最终结果，患者不需要等待。\n"
+        )
+    else:
+        hint += "- 可直接结合上述结论自然引出下一个问题。\n"
+    return hint
+
+
+def build_photo_analysis_summary(tongue: list | None, face: list | None) -> str:
+    """把舌面照结构化分析拼成给患者看的确定性文案（不走 LLM）
+
+    analyze_tongue_images / analyze_face_images 是「每张独立分析」，本函数只播报
+    第一张（多张时注明张数），避免回复过长。
+
+    Args:
+        tongue: 舌照分析结果列表（每张一个 dict）
+        face: 面照分析结果列表
+
+    Returns:
+        可直接前置到本轮回复的分析小结；无有效分析时返回 ""（调用方跳过拼接）
+    """
+    t_item = _first_analysis_item(tongue)
+    f_item = _first_analysis_item(face)
+    if not t_item and not f_item:
+        return ""
+
+    blocks: list[str] = []
+
+    if t_item:
+        title = "【舌象】"
+        total = len([x for x in (tongue or []) if x])
+        if total > 1:
+            title += f"（本次上传 {total} 张，取第 1 张分析）"
+        detail = "，".join(filter(None, [
+            _photo_field("舌色", t_item.get("tongue_color")),
+            _photo_field("舌体", t_item.get("tongue_shape")),
+            _photo_field("苔", "{}{}".format(
+                t_item.get("coating_color") or "",
+                t_item.get("coating_texture") or "",
+            )),
+        ]))
+        blocks.append(_photo_block(
+            title, detail, (t_item.get("analysis") or "").strip(),
+            "舌照分析未成功，请重新拍摄上传（舌面自然伸出、光线充足）。",
+        ))
+
+    if f_item:
+        title = "【面象】"
+        total = len([x for x in (face or []) if x])
+        if total > 1:
+            title += f"（本次上传 {total} 张，取第 1 张分析）"
+        detail = "，".join(filter(None, [
+            _photo_field("面色", f_item.get("face_color")),
+            (f_item.get("complexion") or "").strip(),
+            _photo_field("唇色", f_item.get("lip_color")),
+        ]))
+        blocks.append(_photo_block(
+            title, detail, (f_item.get("description") or "").strip(),
+            "面照分析未成功，请重新拍摄上传（正对镜头、光线充足）。",
+        ))
+
+    received = "和".join(filter(None, [
+        "舌照" if t_item else "",
+        "面照" if f_item else "",
+    ]))
+    return f"已收到您的{received}，分析如下：\n\n" + "\n\n".join(blocks)
+
+
 async def _run_supplement_round(
     orchestrator: LLMOrchestrator,
     request_message: str,
     inquiry_data: dict,
     progress: dict,
     updates: dict[str, Any],
+    photo_summary: str = "",
 ) -> dict[str, Any]:
     """辨证前的补充信息确认轮统一出口（男科追问完成或系统问诊兜底时调用）
 
@@ -538,7 +936,7 @@ async def _run_supplement_round(
 
     progress["supplement_pending"] = True
     updates["inquiry_progress"] = progress
-    updates["response_text"] = SUPPLEMENT_QUESTION
+    updates["response_text"] = _prepend_photo_summary(photo_summary, SUPPLEMENT_QUESTION)
     updates["response_action"] = ActionType.CHAT
     # 补充轮不给选项：有补充直接输入、无补充回复"没有了"（见 SUPPLEMENT_QUESTION 话术）
     updates["response_data"] = ResponseData()
@@ -945,15 +1343,43 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         if tcm_ctx:
             system_prompt = f"{system_prompt}\n\n{tcm_ctx}"
 
-        # 追加问诊进度（主诉链路是否已问清）
+        # ---- 付费前主诉链路：确定性推进（2026-09-23）----
+        # 轮次计数 + 必问点展开；Prompt 里明确给出「本轮必须核实」的点，
+        # 提取器按 id 回报本轮实际核实到的点（见 build_chain_hint）。
         progress = dict(state.get("inquiry_progress") or {})
-        # 进入本轮前是否已问清：progress 下面会被本轮覆盖更新，这里先取快照
-        chain_done_before = bool(progress.get(CHIEF_COMPLAINT_DIMENSION))
+        round_no = int(progress.get(INQUIRY_ROUND_KEY) or 0) + 1
+        progress[INQUIRY_ROUND_KEY] = round_no
+
+        chain_ctx = chain_context(state)
+        chains = resolve_chains(progress, chain_ctx, symptom_chain_context(state))
+        chain_points = required_chain_points_stable(progress, chains, chain_ctx)
+        remaining = chain_remaining(progress, chains, chain_ctx)
+        # 进入本轮前是否已收口：progress 下面会被本轮覆盖更新，这里先取快照
+        chain_done_before = bool(progress.get(CHAIN_DONE_KEY))
         chain_done = "是" if chain_done_before else "否"
+
+        done_ids = [p.id for p in chain_points if p not in remaining]
+        remaining_ids = [p.id for p in remaining]
+        ask_block = ""
+        if remaining:
+            ask_block = (
+                f"- 本轮**必须**核实：{remaining[0].id} {remaining[0].label}\n"
+                "- 只问这一个点（可自然衔接上一轮内容，但不要跳问后面的点）；"
+                "患者回答后该点即算核实。\n"
+            )
         system_prompt += (
-            f"\n\n## 问诊进度\n- 主诉链路是否已问清：{chain_done}\n"
-            "- 尚未问清 → 继续围绕主诉链路追问，**本轮回复里不要出现「付费/支付/费用」等字眼**；\n"
-            "- 已问清 → 本轮只做「综合总结 + 初步判断 + 付费引导」，"
+            f"\n\n## 问诊进度\n"
+            f"- 付费前第 {round_no} 轮"
+            f"（链路需在 {INQUIRY_MIN_ROUNDS}-{INQUIRY_MAX_ROUNDS} 轮内问清）\n"
+            f"- 已识别链路：{_format_chains(chains)}\n"
+            f"- 已核实点：{done_ids or '无'}\n"
+            f"- 未核实点：{remaining_ids or '无'}\n"
+            f"{ask_block}"
+            f"- 主诉链路是否已问清：{chain_done}（**以「未核实点」为准，不以你自己的判断为准**）\n"
+            "- 「未核实点」不为「无」→ 本轮只做「中医分析反馈 + 问下一问」，"
+            "**绝对不要出现「付费/支付/费用」等字眼、也不要写任何总结性收口**，"
+            "哪怕你认为已经问清；\n"
+            "- 「未核实点」为「无」→ 本轮只做「综合总结 + 初步判断 + 付费引导」，"
             "**不得再提出任何新问题、不得给出待答选项**。"
         )
 
@@ -969,7 +1395,9 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             symptom_result = await orchestrator.ainvoke_structured(
                 SymptomExtraction,
                 [
-                    {"role": "system", "content": build_symptom_extraction_prompt()},
+                    {"role": "system", "content": build_symptom_extraction_prompt(
+                        build_chain_hint(chain_points, remaining)
+                    )},
                     {"role": "user", "content": state.get("request_message", "")},
                     {"role": "user", "content": llm_response},
                 ],
@@ -996,10 +1424,32 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 "accompanying_symptoms": symptom_result.accompanying_symptoms,
             }
             updates["inquiry"] = inquiry_data
-            # 合并问诊进度（主诉链路覆盖）
-            if symptom_result.covered_dimensions:
-                progress.update({d: True for d in symptom_result.covered_dimensions})
-                updates["inquiry_progress"] = progress
+
+        # ---- 链路必问点推进（不依赖本轮提取是否成功）----
+        # 付费前的 covered_dimensions **不并入** inquiry_progress：该字段语义是
+        # 「本轮用户消息涉及的维度」，历史上被当成「主诉链路已问清」用（一个键两种
+        # 语义 → 患者答一句跟主诉沾边的话就永久置位，第 2 轮就弹付费卡片，2026-09-23 修）。
+        # 付费前只按链路必问点推进；顺带提过的系统维度留给付费后系统问诊重新逐维确认。
+        covered_now = _clamp_chain_points(
+            symptom_result.covered_chain_points if symptom_result else [], remaining
+        )
+        # 兜底：上一轮系统指定的必核点 + 本轮患者有实质回复 → 视为已核实，
+        # 防 LLM 漏报 covered_chain_points 导致链路卡在同一轮。
+        prev_asked = progress.get(CHAIN_ASKED_KEY)
+        if (
+            prev_asked
+            and str(state.get("request_message") or "").strip()
+            and any(p.id == prev_asked for p in remaining)
+            and prev_asked not in covered_now
+        ):
+            covered_now.append(prev_asked)
+        if covered_now:
+            covered_map = dict(progress.get(CHAIN_POINTS_KEY) or {})
+            covered_map.update({pid: True for pid in covered_now})
+            progress[CHAIN_POINTS_KEY] = covered_map
+            remaining = [p for p in remaining if p.id not in covered_now]
+            remaining_ids = [p.id for p in remaining]
+            logger.info("付费前链路核实：本轮=%s 剩余=%s", covered_now, remaining_ids)
 
         # 检测到支付 → 转入初步辨证（响应交给 preliminary_diagnosis 节点产出）
         if payment_detected:
@@ -1020,27 +1470,95 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         if latest_inquiry:
             response_data.inquiry_json = InquiryJson(**latest_inquiry)
 
+        # ---- 链路收口判定（2026-09-23）----
+        # 主判：必问点全覆盖（代码判定，达即刻收口）；
+        # 辅助：LLM 认为可提前收口（chief_complaint_done）；兜底：达 MAX 轮强制收口。
+        # 辅助信号与关键词兜底都要求已达 MIN 轮——弱信号不得在第 2 轮就弹付费卡片。
+        llm_done = bool(symptom_result and symptom_result.chief_complaint_done)
+        rounds_ok = round_no >= INQUIRY_MIN_ROUNDS
+        chain_done_code = bool(chain_points) and not remaining
+        chain_done_now = False
+        if chain_done_code:
+            chain_done_now = True
+            progress[CHAIN_DONE_SRC_KEY] = "code"
+        elif rounds_ok and llm_done:
+            chain_done_now = True
+            progress[CHAIN_DONE_SRC_KEY] = "llm"
+        elif round_no >= INQUIRY_MAX_ROUNDS:
+            chain_done_now = True
+            progress[CHAIN_DONE_SRC_KEY] = "max"
+        if chain_done_now:
+            progress[CHAIN_DONE_KEY] = True
+            logger.info(
+                "付费前链路收口（第 %s 轮，来源=%s，剩余点=%s）",
+                round_no, progress.get(CHAIN_DONE_SRC_KEY), remaining_ids,
+            )
+
         # 付费引导轮判定（任一成立即进入引导轮）：
-        #   ① 进入本轮前主诉链路已问清 → 之后每轮持续引导，
+        #   ① 进入本轮前已收口 → 之后每轮持续引导，
         #      避免患者答完追问后付费入口消失（只有关键词命中才出卡片，时有时无）
-        #   ② 本轮刚问清（结构化 chief_complaint_done）
+        #   ② 本轮刚收口
         #   ③ 兜底：LLM 回复里已出现付费引导措辞
-        chain_done_now = bool(symptom_result and symptom_result.chief_complaint_done)
-        pay_guided = (
-            chain_done_before
-            or chain_done_now
-            or any(kw in llm_response for kw in ["付费", "支付", "费用"])
-        )
+        #      —— 受三道约束：MIN 轮下限 / 未核实点为空 / 与提问互斥
+        # 守卫（2026-09-23 实测补）：必问点没核实完时，LLM 自己写了「付费」也不算数。
+        # 原实现只看关键词 → 链路上还剩 A5 未核实，仅因 LLM 文本提到付费就放行；而且
+        # chain_done 未落库，下一轮 LLM 若没提付费卡片就消失（"时有时无"的翻版）。
+        # 与主判据（必问点全覆盖）对齐后，收口只能来自 code/llm/max 三条正规路径。
+        mention_pay = any(kw in llm_response for kw in ("付费", "支付", "费用"))
+        keyword_pay = rounds_ok and not remaining and mention_pay
+        if mention_pay and rounds_ok and remaining:
+            logger.warning(
+                "本轮 LLM 回复提到付费，但必问点尚未核实完 %s → 关键词兜底不生效，"
+                "按提问轮处理（本轮不出付费卡片）",
+                remaining_ids,
+            )
+        # 互斥守卫：提示词硬约束是「提问轮不提付费、付费轮不提问」。若本轮既提付费
+        # 又还在提问（实测原话：「…建议您进行付费咨询。请问您平时有没有阴囊坠胀感？」），
+        # 说明这轮生成自相矛盾 → 按提问轮处理，不出付费卡片（2026-09-23 实测再犯）。
+        if keyword_pay and _looks_like_question(llm_response):
+            logger.warning(
+                "付费措辞与追问出现在同一轮 → 按提问轮处理，本轮不出付费卡片"
+            )
+            keyword_pay = False
+        pay_guided = chain_done_before or chain_done_now or keyword_pay
+
+        # 冲突仲裁（2026-09-23）：收口来源是「LLM 辅助」（代码复核仍有未核实点）而本轮
+        # LLM 又判自己没问清 → 以本轮现判为准，本轮不出付费卡片，否则就是「一边追问一边
+        # 收费」。来源为 code/max 时不抑制：代码已确认必问点全部核实（或已达 MAX 兜底），
+        # LLM 之后仍想追问属自相矛盾，以代码为准，避免付费入口被卡住。
+        if (
+            pay_guided
+            and not chain_done_now
+            and chain_done_before
+            and progress.get(CHAIN_DONE_SRC_KEY) == "llm"
+            and remaining
+            and not llm_done
+            and round_no < INQUIRY_MAX_ROUNDS
+        ):
+            logger.warning(
+                "付费引导抑制：chain_done 由 LLM 辅助置位，但代码复核仍有未核实点 %s，"
+                "且本轮 LLM 又判未问清 → 本轮不出付费卡片",
+                remaining_ids,
+            )
+            pay_guided = False
         response_data.need_pay = pay_guided
+
+        # 下一轮必核点（付费引导轮不追问 → 清空）
+        if remaining and not pay_guided:
+            progress[CHAIN_ASKED_KEY] = remaining[0].id
+        else:
+            progress.pop(CHAIN_ASKED_KEY, None)
+        updates["inquiry_progress"] = progress
 
         # 付费引导轮与追问互斥：引导付费时不再输出问答选项。
         # 否则前端会同时渲染「立即购买」卡片和待答 chips —— 一边追问一边收费，
         # 患者不知道是付钱还是答问题（2026-09-20 修）。
         if pay_guided:
             logger.info(
-                "主诉链路已问清（before=%s / now=%s），本轮为付费引导轮，抑制问答选项",
+                "主诉链路已问清（before=%s / now=%s / 来源=%s），本轮为付费引导轮，抑制问答选项",
                 chain_done_before,
                 chain_done_now,
+                progress.get(CHAIN_DONE_SRC_KEY, ""),
             )
         else:
             # 问答选项（QuestionChoices 结构化提取）
@@ -1115,6 +1633,12 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         # ============================================================
         # 优先取请求中的，否则从会话读取支付时已保存的
         hos_info = state.get("request_hos_sick_info") or state.get("hos_sick_info")
+        # 就诊人同时落到会话字段 hos_sick_info（与 patient_info_confirmed 同源同义）：
+        # 原来只有 INQUIRY 节点写 hos_sick_info，本节点与 selecting_patient 只写
+        # patient_info_confirmed → Redis 过期后从 MySQL 恢复时 hos_sick_info 为空，
+        # 停在 SELECTING_PATIENT 的会话会被要求重新选一次就诊人（2026-09-23 修）。
+        if hos_info:
+            updates["hos_sick_info"] = hos_info
 
         if hos_info:
             is_match, reason = simple_patient_match(patient_info, hos_info)
@@ -1189,7 +1713,9 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         if state.get("request_hos_sick_info"):
             confirmed = dict(state["request_hos_sick_info"])
         else:
-            session_confirmed = state.get("hos_sick_info")
+            # 兼容回退：hos_sick_info 与 patient_info_confirmed 同源同义，老会话可能
+            # 只落了后者（改动前 preliminary_diagnosis/selecting_patient 只写后者）。
+            session_confirmed = state.get("hos_sick_info") or state.get("patient_info_confirmed")
             if not session_confirmed:
                 return {
                     "response_text": "请选择本次问诊的就诊人。",
@@ -1211,6 +1737,9 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         pending = state.get("patient_select_pending", False)
         mismatch_reason = state.get("mismatch_reason") or "信息不一致"
         updates: dict[str, Any] = {}
+        # 选定就诊人写回会话字段（含待确认分支）：Redis 过期后从 MySQL 恢复、且仍停在
+        # SELECTING_PATIENT 时，selecting_patient 读的就是 hos_sick_info，不写会要求重选。
+        updates["hos_sick_info"] = dict(confirmed)
 
         # ① 用户消息若修改了「收集数据」→ 更新（用户修改为准），后续用新数据重比
         collected_changed = False
@@ -1320,6 +1849,8 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         progress = dict(state.get("inquiry_progress") or {})
         updates: dict[str, Any] = {}
 
+        # 本轮是否新上传舌面照 → 决定本轮回复是否播报分析结论
+        photo_summary = ""
         # 1. 本轮带舌面照 → 分析并写入（不立即转诊断）
         if tongue_urls or face_urls:
             tongue_result = await analyze_tongue_images(
@@ -1330,6 +1861,8 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             updates["image_urls"] = tongue_urls + face_urls
             updates["tongue_analysis"] = tongue_result
             updates["face_analysis"] = face_result
+            # 分析结论必须在本轮回复中给患者（此前只写状态，患者看不到任何舌面照反馈）
+            photo_summary = build_photo_analysis_summary(tongue_result, face_result)
             # 舌面照分析出结论后 → 做一次辨病辨证（收敛），供后续男科针对性追问；
             # 重传舌面照同样走这里 → 重新分析 + 重新辨证
             merged = dict(state)
@@ -1370,6 +1903,8 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 f"- 本轮**必须**按顺序询问待问维度中的第一个（{asked_dim}），"
                 "不要跳问其他维度；用户回答后判断该维度是否已覆盖。"
             )
+            if photo_summary:
+                system_prompt += build_photo_prompt_hint(photo_summary)
             messages = await build_chat_messages(
                 system_prompt, state, state.get("request_message", ""),
                 SessionState.UPLOADING_IMAGES,
@@ -1444,7 +1979,7 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 await _set_choices(
                     response_data, orchestrator, state.get("request_message", ""), llm_response
                 )
-                updates["response_text"] = llm_response
+                updates["response_text"] = _prepend_photo_summary(photo_summary, llm_response)
                 updates["response_action"] = ActionType.CHAT
                 updates["response_data"] = response_data
                 return updates
@@ -1466,7 +2001,7 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             if progress.get("supplement_pending") or progress.get("supplement_done"):
                 return await _run_supplement_round(
                     orchestrator, state.get("request_message", ""),
-                    inquiry_data, progress, updates,
+                    inquiry_data, progress, updates, photo_summary,
                 )
             # 若收敛辨证是照片上传时做的（早于系统问诊完成）→ 用完整系统问诊数据补收敛
             if _systemic_done(progress) and not progress.get("converged_with_inquiry"):
@@ -1482,6 +2017,9 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 logger.info("男科追问前补收敛辨证: %s / %s",
                             diagnosis.get("disease"), diagnosis.get("syndrome"))
             male_prompt = _build_male_inquiry_prompt(diagnosis, male_rounds)
+            # 男科追问分支此前没有播报约束 → LLM 会自己再描述一遍舌象/面象
+            # （2026-09-23 实测：「这次收到照片后我仔细看了」），与系统播报重复。
+            male_prompt += build_photo_prompt_hint(photo_summary)
             messages = await build_chat_messages(
                 male_prompt, state, state.get("request_message", ""),
                 SessionState.UPLOADING_IMAGES,
@@ -1534,7 +2072,7 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
                 logger.info("男科追问完成（第 %d 轮），进入补充信息确认轮", male_rounds)
                 return await _run_supplement_round(
                     orchestrator, state.get("request_message", ""),
-                    inquiry_data, progress, updates,
+                    inquiry_data, progress, updates, photo_summary,
                 )
             # 男科追问未达标 → 继续追问
             response_data = ResponseData()
@@ -1543,7 +2081,7 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
             await _set_choices(
                 response_data, orchestrator, state.get("request_message", ""), llm_response
             )
-            updates["response_text"] = llm_response
+            updates["response_text"] = _prepend_photo_summary(photo_summary, llm_response)
             updates["response_action"] = ActionType.CHAT
             updates["response_data"] = response_data
             return updates
@@ -1569,7 +2107,7 @@ def build_nodes(orchestrator: LLMOrchestrator) -> dict[str, Any]:
         inquiry_data = updates.get("inquiry") or dict(state.get("inquiry") or {})
         return await _run_supplement_round(
             orchestrator, state.get("request_message", ""),
-            inquiry_data, progress, updates,
+            inquiry_data, progress, updates, photo_summary,
         )
 
     # ----------------------------------------------------------
