@@ -8,7 +8,6 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from logging.handlers import RotatingFileHandler
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,29 +15,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import register_routers
 from app.common.handlers import register_exception_handlers
 from app.core.config import settings
+from app.core.log_config import LOG_FORMAT, build_daily_file_handler
 from app.knowledge.tcm_matcher import tcm_matcher
 from app.storage.mysql import mysql_client
 from app.storage.redis import redis_client
 
 # 日志配置
 _LOG_LEVEL = logging.DEBUG if settings.DEBUG else logging.INFO
-_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 # 控制台日志
-logging.basicConfig(level=_LOG_LEVEL, format=_LOG_FORMAT)
+logging.basicConfig(level=_LOG_LEVEL, format=LOG_FORMAT)
 
-# 文件日志（自动创建 logs 目录）
+# 文件日志：按天切分（本地时区 00:00 滚动），当天写 logs/agent.log，
+# 历史归档为 logs/agent-YYYY-MM-DD.log（保留 30 天）。配置与说明见 app/core/log_config.py
 _log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
-os.makedirs(_log_dir, exist_ok=True)
-
-_file_handler = RotatingFileHandler(
-    filename=os.path.join(_log_dir, "agent.log"),
-    maxBytes=10 * 1024 * 1024,  # 10MB
-    backupCount=5,
-    encoding="utf-8",
-)
-_file_handler.setLevel(_LOG_LEVEL)
-_file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+_file_handler = build_daily_file_handler(_log_dir, level=_LOG_LEVEL)
 
 # 添加到根日志器
 logging.getLogger().addHandler(_file_handler)
